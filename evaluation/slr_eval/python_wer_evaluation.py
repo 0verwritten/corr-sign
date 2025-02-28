@@ -35,7 +35,6 @@ def get_wer_delsubins(ref, hyp, merge_same=False, align_results=False,
                       penalty={'ins': 1, 'del': 1, 'sub': 1}):
     # whether merge glosses before evaluation
     hyp = hyp if not merge_same else [x[0] for x in groupby(hyp)]
-
     # initialization
     ref_lgt = len(ref) + 1
     hyp_lgt = len(hyp) + 1
@@ -44,12 +43,10 @@ def get_wer_delsubins(ref, hyp, merge_same=False, align_results=False,
     # auxiliary values
     costs[0, :] = np.arange(hyp_lgt) * penalty['ins']
     costs[:, 0] = np.arange(ref_lgt) * penalty['del']
-
     backtrace = np.zeros((ref_lgt, hyp_lgt), dtype=np.int32)
     # auxiliary indexes, 0, 1, 2, 3 are corresponding to correct, substitute, insert and delete, respectively
     backtrace[0, :] = 2
     backtrace[:, 0] = 3
-
     # dynamic programming
     for i in range(1, ref_lgt):
         for j in range(1, hyp_lgt):
@@ -65,7 +62,6 @@ def get_wer_delsubins(ref, hyp, merge_same=False, align_results=False,
                 if min_cost < costs[i, j]:
                     costs[i, j] = min_cost
                     backtrace[i, j] = [sub_cost, ins_cost, del_cost].index(costs[i, j]) + 1
-
     # backtrace pointer
     bt_ptr = np.array([ref_lgt - 1, hyp_lgt - 1])
     bt_path = []
@@ -89,7 +85,6 @@ def get_wer_delsubins(ref, hyp, merge_same=False, align_results=False,
         else:
             assert "Unexpected Operation"
         bt_path.append((bt_ptr, op))
-
     # decode path
     aligned_gt = []
     aligned_pred = []

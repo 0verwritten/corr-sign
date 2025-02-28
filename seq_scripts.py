@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 from evaluation.slr_eval.wer_calculation import evaluate
 from torch.cuda.amp import autocast as autocast
 from torch.cuda.amp import GradScaler
+import gc
 
 def seq_train(loader, model, optimizer, device, epoch_idx, recoder):
     model.train()
@@ -25,12 +26,14 @@ def seq_train(loader, model, optimizer, device, epoch_idx, recoder):
         optimizer.zero_grad()
         with autocast():
             ret_dict = model(vid, vid_lgt, label=label, label_lgt=label_lgt)
-            loss = model.criterion_calculation(ret_dict, label, label_lgt)
+            loss, _ = model.criterion_calculation(ret_dict, label, label_lgt)
         if np.isinf(loss.item()) or np.isnan(loss.item()):
             print('loss is nan')
             #print(data[-1])
             print(str(data[1])+'  frames')
             print(str(data[3])+'  glosses')
+            del ret_dict
+            del loss
             continue
         scaler.scale(loss).backward()
         scaler.step(optimizer.optimizer)
@@ -45,6 +48,10 @@ def seq_train(loader, model, optimizer, device, epoch_idx, recoder):
         del loss
     optimizer.scheduler.step()
     recoder.print_log('\tMean training loss: {:.10f}.'.format(np.mean(loss_value)))
+    del loss_value
+    del clr
+    gc.collect()
+    torch.cuda.empty_cache()
     return 
 
 
@@ -100,6 +107,7 @@ def seq_eval(cfg, loader, model, device, mode, epoch, work_dir, recoder,
     del vid_lgt
     del label
     del label_lgt
+    gc.collect()
     recoder.print_log(f"Epoch {epoch}, {mode} {lstm_ret: 2.2f}%", f"{work_dir}/{mode}.txt")
     return lstm_ret
 

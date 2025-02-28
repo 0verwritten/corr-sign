@@ -3,6 +3,9 @@ import torch.nn as nn
 import torch.utils.model_zoo as model_zoo
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+import cv2
+import numpy as np
+import os
 __all__ = [
     'ResNet', 'resnet10', 'resnet18', 'resnet34', 'resnet50', 'resnet101',
     'resnet152', 'resnet200'
@@ -82,7 +85,6 @@ class Temporal_weighting(nn.Module):
         hidden_size = input_size//16
         self.conv_transform = nn.Conv1d(input_size, hidden_size, kernel_size=1, stride=1, padding=0)
         self.conv_back = nn.Conv1d(hidden_size, input_size, kernel_size=1, stride=1, padding=0)
-        #self.conv_enhance = nn.Conv1d(hidden_size, hidden_size, kernel_size=9, stride=1, padding=4)
         self.num = 3
         self.conv_enhance = nn.ModuleList([
             nn.Conv1d(hidden_size, hidden_size, kernel_size=3, stride=1, padding=int(i+1), groups=hidden_size, dilation=int(i+1)) for i in range(self.num)
@@ -124,20 +126,20 @@ class Get_Correlation(nn.Module):
         self.weights = nn.Parameter(torch.ones(3) / 3, requires_grad=True)
         self.conv_back = nn.Conv3d(reduction_channel, channels, kernel_size=1, bias=False)
 
-    def forward(self, x):
+    def forward(self, x, return_affinity=False):
         N, C, T, H, W = x.shape
         def clustering(query, key):
             affinities = torch.einsum('bctp,bctl->btpl', query, key)
-            return torch.einsum('bctl,btpl->bctp', key, F.sigmoid(affinities)-0.5)
-        
+            return torch.einsum('bctl,btpl->bctp', key, F.sigmoid(affinities)-0.5), affinities
+
         x_mean = x.mean(3, keepdim=True).mean(4, keepdim=False)
         x_max = x.max(-1, keepdim=False)[0].max(-1, keepdim=True)[0]
         x_att = self.attpool(x) #NCTP
         x2 = self.down_conv2(x)
         upfold = self.unfold(x2)
-        upfold = (torch.concat([upfold[:,:,:,:self.neighbors], upfold[:,:,:,self.neighbors+1:]],3)* self.weights2.view(1, 1, 1, -1, 1, 1)).view(N, C, T, -1)
+        upfold = (torch.concat([upfold[:,:,:,:self.neighbors], upfold[:,:,:,self.neighbors+1:]],3)* self.weights2.view(1, 1, 1, -1, 1, 1)).view(N, C, T, -1) #NCT(SHW)
         x_mean = x_mean*self.weights4[0] + x_max*self.weights4[1] + x_att*self.weights4[2]
-        x_mean = clustering(x_mean, upfold)
+        x_mean, affinities = clustering(x_mean, upfold)
         features = x_mean.view(N, C, T, self.clusters, 1)
 
         x_down = self.down_conv(x)
@@ -146,8 +148,10 @@ class Get_Correlation(nn.Module):
         aggregated_x = self.conv_back(aggregated_x)
         
         features = features * (F.sigmoid(aggregated_x)-0.5)
-        return features
-        
+        if not return_affinity:
+            return features
+        else:
+            return features, affinities[0,:,0].view(-1, 2*self.neighbors, H, W)  #T(2*neighbors)HW 
 
 def conv3x3(in_planes, out_planes, stride=1):
     # 3x3x3 convolution with padding
@@ -238,8 +242,9 @@ class ResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def forward(self, x):
+    def forward(self, x, dataset):
         N, C, T, H, W = x.size()
+        vid = x
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
@@ -250,12 +255,17 @@ class ResNet(nn.Module):
         x = x + self.corr2(x) * self.alpha[0]
         x = x + self.temporal_weight2(x)
         x = self.layer3(x)
-        x = x + self.corr3(x) * self.alpha[1]
+
+        print(f'self.alpha: {self.alpha}')
+        update_feature, affinities = self.corr3(x, return_affinity=True)  #bcthw, shw
+        x = x + update_feature * self.alpha[1]
+        show_corr_img(vid[0].permute(1,0,2,3), affinities, out_dir=f'./corr_map_layer3', clear_folder=True, dataset=dataset) #tchw, t(2*neighbors)hw
+
         x = x + self.temporal_weight3(x)
         x = self.layer4(x)
         x = x + self.corr4(x) * self.alpha[2]
         x = x + self.temporal_weight4(x)
-    
+        
         x = x.transpose(1,2).contiguous()
         x = x.view((-1,)+x.size()[2:]) #bt,c,h,w
 
@@ -264,6 +274,51 @@ class ResNet(nn.Module):
         x = self.fc(x) #bt,c
 
         return x
+
+def show_corr_img(img, affinities, out_dir='./corr_map', clear_folder=False, dataset='phoenix2014'):  # img: chw, feature_map: chw, grads: chw3
+    affinities = affinities.cpu().data.numpy()
+    if clear_folder:
+        if not os.path.exists(out_dir):
+            os.makedirs(out_dir)
+        else:
+            import shutil
+            shutil.rmtree(out_dir)
+            os.makedirs(out_dir)
+
+    predefined_padding = 6 # Note that there are 6 paddings in advance in the left/right
+    T, S, H, W = affinities.shape	
+    neighbors = S//2	
+    for t in range(predefined_padding, T-predefined_padding+1):
+        current_dir = out_dir + '/' + f'timestep_{t-predefined_padding}'
+        os.makedirs(current_dir)
+        for i in range(S):
+            if 'phoenix' in dataset:
+                out_cam = affinities[t,i]  # only set as negative when alpha is positive for the layer
+            else:
+                out_cam = -affinities[t,i] 
+            out_cam = out_cam - np.min(out_cam)
+            out_cam = out_cam / (1e-7 + out_cam.max())
+            out_cam = cv2.resize(out_cam, (img.shape[2], img.shape[3]))
+            out_cam = (255 * out_cam).astype(np.uint8)
+            heatmap = cv2.applyColorMap(out_cam, cv2.COLORMAP_JET)
+            # img[neighbors] is the current image
+            if i<neighbors:
+                cam_img = np.float32(heatmap) / 255 + (img[t-(neighbors-i)]/2+0.5).permute(1,2,0).cpu().data.numpy()
+            else:
+                cam_img = np.float32(heatmap) / 255 + (img[t+(i-neighbors)+1]/2+0.5).permute(1,2,0).cpu().data.numpy()
+            cam_img = cam_img/np.max(cam_img)
+            cam_img = np.uint8(255 * cam_img)
+            # img[neighbors] is the current image
+            if i<neighbors:
+                cv2.imwrite(f'{current_dir}/corr_map_{i}.jpg', cam_img)
+            else:
+                cv2.imwrite(f'{current_dir}/corr_map_{i+1}.jpg', cam_img)
+        current_img = (img[t]/2+0.5).permute(1,2,0).cpu().data.numpy()
+        current_img = current_img/np.max(current_img)
+        current_img = np.uint8(255 * current_img)
+        #interval = img.shape[2]//H
+        #current_img[i*interval:(i+1)*interval, j*interval:(j+1)*interval,:] = np.array([0,0,255])  #red
+        cv2.imwrite(f'{current_dir}/corr_map_{neighbors}_current.jpg', current_img)
 
 def resnet18(**kwargs):
     """Constructs a ResNet-18 based model.

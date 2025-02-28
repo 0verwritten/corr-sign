@@ -105,6 +105,52 @@ class Processor():
                     self.data_loader[mode + "_eval" if mode == "train" else mode],
                     self.model, self.device, mode, self.arg.work_dir, self.recoder
                 )
+        elif self.arg.phase == 'finetune':
+            best_dev = 100.0
+            best_epoch = 0
+            total_time = 0
+            epoch_time = 0
+            self.recoder.print_log('Parameters:\n{}\n'.format(str(vars(self.arg))))
+            seq_model_list = []
+            for name, m in self.model.conv2d.named_modules():
+                m.requires_grad = False
+            for name, m in self.model.conv1d.named_modules():
+                if 'fc' not in name:
+                    m.requires_grad = False
+            for name, m in self.model.temporal_model.named_modules():
+                m.requires_grad = False
+            from slr_network import NormLinear
+            self.model.classifier = NormLinear(1024, len(self.gloss_dict) + 1).cuda()
+            self.model.conv1d.fc = self.model.classifier
+
+            for epoch in range(self.arg.optimizer_args['start_epoch'], self.arg.num_epoch):
+                save_model = epoch % self.arg.save_interval == 0
+                eval_model = epoch % self.arg.eval_interval == 0
+                epoch_time = time.time()
+                # train end2end model
+                seq_train(self.data_loader['train'], self.model, self.optimizer,
+                          self.device, epoch, self.recoder)
+                if eval_model:
+                    dev_wer = seq_eval(self.arg, self.data_loader['dev'], self.model, self.device,
+                                       'dev', epoch, self.arg.work_dir, self.recoder, self.arg.evaluate_tool)
+                    self.recoder.print_log("Dev WER: {:05.2f}%".format(dev_wer))
+                if dev_wer < best_dev:
+                    best_dev = dev_wer
+                    best_epoch = epoch
+                    model_path = "{}_best_model.pt".format(self.arg.work_dir)
+                    self.save_model(epoch, model_path)
+                    self.recoder.print_log('Save best model')
+                self.recoder.print_log('Best_dev: {:05.2f}, Epoch : {}'.format(best_dev, best_epoch))
+                if save_model:
+                    model_path = "{}dev_{:05.2f}_epoch{}_model.pt".format(self.arg.work_dir, dev_wer, epoch)
+                    seq_model_list.append(model_path)
+                    print("seq_model_list", seq_model_list)
+                    self.save_model(epoch, model_path)
+                epoch_time = time.time() - epoch_time
+                total_time += epoch_time
+                torch.cuda.empty_cache()
+                self.recoder.print_log('Epoch {} costs {} mins {} seconds'.format(epoch, int(epoch_time)//60, int(epoch_time)%60))
+            self.recoder.print_log('Training costs {} hours {} mins {} seconds'.format(int(total_time)//60//60, int(total_time)//60%60, int(total_time)%60))
 
     def save_arg(self):
         arg_dict = vars(self.arg)
@@ -198,9 +244,9 @@ class Processor():
         if self.arg.dataset == 'CSL':
             dataset_list = zip(["train", "dev"], [True, False])
         elif 'phoenix' in self.arg.dataset:
-            dataset_list = zip(["train", "train_eval", "dev", "test"], [True, False, False, False]) 
+            dataset_list = zip(["train", "dev", "test"], [True, False, False]) 
         elif self.arg.dataset == 'CSL-Daily':
-            dataset_list = zip(["train", "train_eval", "dev", "test"], [True, False, False, False])
+            dataset_list = zip(["train", "dev", "test"], [True, False, False])
         for idx, (mode, train_flag) in enumerate(dataset_list):
             arg = self.arg.feeder_args
             arg["prefix"] = self.arg.dataset_info['dataset_root']

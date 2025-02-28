@@ -8,12 +8,14 @@ from slr_network import SLRModel
 import torch
 from collections import OrderedDict
 import utils
-gpu_id = 0 # which gpu to use
-dataset = 'phoenix2014' # support [phoenix2014, phoenix2014-T, CSL-Daily]
-prefix = './dataset/phoenix2014/phoenix-2014-multisigner' # ['./dataset/CSL-Daily', './dataset/phoenix2014-T', './dataset/phoenix2014/phoenix-2014-multisigner']
+
+gpu_id = 0 # The GPU to use
+dataset = 'phoenix2014'  # support [phoenix2014, phoenix2014-T, CSL-Daily]
+prefix = './dataset/phoenix2014/phoenix-2014-multisigner'  # ['./dataset/CSL-Daily', './dataset/phoenix2014-T', './dataset/phoenix2014/phoenix-2014-multisigner']
 dict_path = f'./preprocess/{dataset}/gloss_dict.npy'
-model_weights = 'path_to_model_weights'  #TODO: replace with your path
-select_id = 0 # The video selected to show. 539 for 31October_2009_Saturday_tagesschau_default-8, 0 for 01April_2010_Thursday_heute_default-1, 1 for 01August_2011_Monday_heute_default-6, 2 for 01December_2011_Thursday_heute_default-3
+model_weights = 'path_to_model.pt'
+select_id = 2 # The video selected to show. 539 for 31October_2009_Saturday_tagesschau_default-8, 0 for 01April_2010_Thursday_heute_default-1, 1 for 01August_2011_Monday_heute_default-6, 2 for 01December_2011_Thursday_heute_default-3
+#name = '01April_2010_Thursday_heute_default-1'
 
 # Load data and apply transformation
 gloss_dict = np.load(dict_path, allow_pickle=True).item()
@@ -63,7 +65,6 @@ vid = torch.cat(
     , dim=0).unsqueeze(0)
 
 fmap_block = list()
-#grad_block = list()
 
 device = utils.GpuDataParallel()
 device.set_device(gpu_id)
@@ -84,6 +85,7 @@ if 'phoenix' in dataset:
     model.conv2d.corr2.conv_back.register_forward_hook(forward_hook)	
 else:
     model.conv2d.corr3.conv_back.register_forward_hook(forward_hook)  # For CSL-Daily
+#model.conv2d.layer4[-1].conv1.register_backward_hook(backward_hook)
 
 def cam_show_img(img, feature_map, grads, out_dir):  # img: ntchw, feature_map: ncthw, grads: ncthw
     N, C, T, H, W = feature_map.shape
@@ -122,7 +124,13 @@ label = device.data_to_device([torch.LongTensor(label)])
 label_lgt = device.data_to_device(torch.LongTensor([len(label_list)]))
 ret_dict = model(vid, vid_lgt, label=label, label_lgt=label_lgt)
 
+model.zero_grad()
+for i in range(ret_dict['sequence_logits'].size(0)):
+    idx = np.argmax(ret_dict['sequence_logits'].cpu().data.numpy()[i,0])  #TBC
+    class_loss = ret_dict['sequence_logits'][i, 0, idx]
+    class_loss.backward(retain_graph=True)
+# 生成cam
 grads_val = torch.load('./weight_map.pth').cpu().data.numpy()
 fmap = fmap_block[0].cpu().data.numpy()
-
-cam_show_img(vid, fmap, grads_val, out_dir='./CAM_images')
+# 保存cam图片
+cam_show_img(vid, fmap, grads_val, out_dir='./agg_map')

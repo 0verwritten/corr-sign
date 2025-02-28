@@ -109,24 +109,36 @@ class SLRModel(nn.Module):
             "sequence_logits": outputs,
             "conv_sents": conv_pred,
             "recognized_sents": pred,
+            "loss_LiftPool_u": conv1d_outputs['loss_LiftPool_u'],
+            "loss_LiftPool_p": conv1d_outputs['loss_LiftPool_p'],
         }
 
     def criterion_calculation(self, ret_dict, label, label_lgt):
         loss = 0
+        total_loss = {}
         for k, weight in self.loss_weights.items():
             if k == 'ConvCTC':
-                loss += weight * self.loss['CTCLoss'](ret_dict["conv_logits"].log_softmax(-1),
+                total_loss['ConvCTC'] = weight * self.loss['CTCLoss'](ret_dict["conv_logits"].log_softmax(-1),
                                                       label.cpu().int(), ret_dict["feat_len"].cpu().int(),
                                                       label_lgt.cpu().int()).mean()
+                loss += total_loss['ConvCTC']
             elif k == 'SeqCTC':
-                loss += weight * self.loss['CTCLoss'](ret_dict["sequence_logits"].log_softmax(-1),
+                total_loss['SeqCTC'] = weight * self.loss['CTCLoss'](ret_dict["sequence_logits"].log_softmax(-1),
                                                       label.cpu().int(), ret_dict["feat_len"].cpu().int(),
                                                       label_lgt.cpu().int()).mean()
+                loss += total_loss['SeqCTC']
             elif k == 'Dist':
-                loss += weight * self.loss['distillation'](ret_dict["conv_logits"],
+                total_loss['Dist'] = weight * self.loss['distillation'](ret_dict["conv_logits"],
                                                            ret_dict["sequence_logits"].detach(),
                                                            use_blank=False)
-        return loss
+                loss += total_loss['Dist']
+            elif k == 'Cu':
+                total_loss['Cu'] = weight * ret_dict["loss_LiftPool_u"]
+                loss += total_loss['Cu']
+            elif k == 'Cp':
+                total_loss['Cp'] = weight * ret_dict["loss_LiftPool_p"]   
+                loss += total_loss['Cp'] 
+        return loss, total_loss
 
     def criterion_init(self):
         self.loss['CTCLoss'] = torch.nn.CTCLoss(reduction='none', zero_infinity=False)
