@@ -111,15 +111,6 @@ class BaseFeeder(data.Dataset):
                 video_augmentation.ToTensor(),
             ])
 
-    def byte_to_img(self, byteflow):
-        unpacked = pa.deserialize(byteflow)
-        imgbuf = unpacked[0]
-        buf = six.BytesIO()
-        buf.write(imgbuf)
-        buf.seek(0)
-        img = Image.open(buf).convert('RGB')
-        return img
-
     @staticmethod
     def collate_fn(batch):
         batch = [item for item in sorted(batch, key=lambda x: len(x[0]), reverse=True)]

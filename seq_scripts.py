@@ -9,24 +9,37 @@ from tqdm import tqdm
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from evaluation.slr_eval.wer_calculation import evaluate
-from torch.cuda.amp import autocast as autocast
-from torch.cuda.amp import GradScaler
-import gc
+from torch.amp import autocast, GradScaler
 
-def seq_train(loader, model, optimizer, device, epoch_idx, recoder):
+from utils.device import GpuDataParallel
+import utils
+
+import os
+import torch
+
+def seq_train(loader: torch.utils.data.DataLoader, model, optimizer: utils.Optimizer, device: GpuDataParallel, epoch_idx: int, recoder: utils.Recorder):
     model.train()
     loss_value = []
     clr = [group['lr'] for group in optimizer.optimizer.param_groups]
-    scaler = GradScaler()
+    scaler = GradScaler(device.output_device)
+    accumulation_steps = 2  # Accumulate gradients over 2 batches
+
     for batch_idx, data in enumerate(tqdm(loader)):
+        print(
+            f"Batch {batch_idx}: ",
+            list([x.shape if "shape" in dir(x) else x for x in data]),
+        )
         vid = device.data_to_device(data[0])
         vid_lgt = device.data_to_device(data[1])
         label = device.data_to_device(data[2])
         label_lgt = device.data_to_device(data[3])
+        # import IPython as ipy; ipy.embed()
+        
         optimizer.zero_grad()
-        with autocast():
+        with autocast(device.output_device):
             ret_dict = model(vid, vid_lgt, label=label, label_lgt=label_lgt)
-            loss, _ = model.criterion_calculation(ret_dict, label, label_lgt)
+            loss = model.criterion_calculation(ret_dict, label, label_lgt) / accumulation_steps
+
         if np.isinf(loss.item()) or np.isnan(loss.item()):
             print('loss is nan')
             #print(data[-1])
@@ -35,17 +48,22 @@ def seq_train(loader, model, optimizer, device, epoch_idx, recoder):
             del ret_dict
             del loss
             continue
+        
         scaler.scale(loss).backward()
-        scaler.step(optimizer.optimizer)
-        scaler.update()
+        
+        if (batch_idx + 1) % accumulation_steps == 0:
+            scaler.step(optimizer.optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+
         # nn.utils.clip_grad_norm_(model.rnn.parameters(), 5)
-        loss_value.append(loss.item())
+        loss_value.append(loss.cpu().item())
         if batch_idx % recoder.log_interval == 0:
             recoder.print_log(
                 '\tEpoch: {}, Batch({}/{}) done. Loss: {:.8f}  lr:{:.6f}'
-                    .format(epoch_idx, batch_idx, len(loader), loss.item(), clr[0]))
-        del ret_dict
-        del loss
+                    .format(epoch_idx, batch_idx, len(loader), loss.cpu().item(), clr[0]))
+        del ret_dict, loss, vid, vid_lgt, label, label_lgt
+        torch.cuda.empty_cache()
     optimizer.scheduler.step()
     recoder.print_log('\tMean training loss: {:.10f}.'.format(np.mean(loss_value)))
     del loss_value

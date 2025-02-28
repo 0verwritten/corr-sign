@@ -23,18 +23,25 @@ from seq_scripts import seq_train, seq_eval, seq_feature_generation
 from torch.cuda.amp import autocast as autocast
 
 class Processor():
+    data_loader: dict[str, torch.utils.data.DataLoader]
+    model: any # slr_network.SLRModel
+    optimizer: utils.Optimizer
+
     def __init__(self, arg):
         self.arg = arg
-        if os.path.exists(self.arg.work_dir):
-            answer = input('Current dir exists, do you want to remove and refresh it?\n')
-            if answer in ['yes','y','ok','1']:
-                print('Dir removed !')
-                shutil.rmtree(self.arg.work_dir)
-                os.makedirs(self.arg.work_dir)
-            else:
-                print('Dir Not removed !')
-        else:
-            os.makedirs(self.arg.work_dir)
+        # if os.path.exists(self.arg.work_dir):
+        #     answer = input('Current dir exists, do you want to remove and refresh it?\n')
+        #     if answer in ['yes','y','ok','1']:
+        #         print('Dir removed !')
+        #         shutil.rmtree(self.arg.work_dir)
+        #         os.makedirs(self.arg.work_dir)
+        #     else:
+        #         print('Dir Not removed !')
+        # else:
+        #     os.makedirs(self.arg.work_dir)
+        print('Dir removed !')
+        shutil.rmtree(self.arg.work_dir)
+        os.makedirs(self.arg.work_dir)
         shutil.copy2(__file__, self.arg.work_dir)
         shutil.copy2('./configs/baseline.yaml', self.arg.work_dir)
         shutil.copy2('./modules/tconv.py', self.arg.work_dir)
@@ -49,22 +56,25 @@ class Processor():
         self.data_loader = {}
         self.gloss_dict = np.load(self.arg.dataset_info['dict_path'], allow_pickle=True).item()
         self.arg.model_args['num_classes'] = len(self.gloss_dict) + 1
-        self.model, self.optimizer = self.loading()
+        self.model, self.optimizer = self.load_model()
+        self.load_data()
 
     def start(self):
-        if self.arg.phase == 'train':
+        # if self.arg.phase == 'train':
+        if self.arg.phase in ['train','dev']:
             best_dev = 100.0
             best_epoch = 0
             total_time = 0
             epoch_time = 0
             self.recoder.print_log('Parameters:\n{}\n'.format(str(vars(self.arg))))
             seq_model_list = []
+            torch.cuda.empty_cache()
             for epoch in range(self.arg.optimizer_args['start_epoch'], self.arg.num_epoch):
                 save_model = epoch % self.arg.save_interval == 0
                 eval_model = epoch % self.arg.eval_interval == 0
                 epoch_time = time.time()
                 # train end2end model
-                seq_train(self.data_loader['train'], self.model, self.optimizer,
+                seq_train(self.data_loader[self.arg.phase], self.model, self.optimizer,
                           self.device, epoch, self.recoder)
                 if eval_model:
                     dev_wer = seq_eval(self.arg, self.data_loader['dev'], self.model, self.device,
@@ -168,7 +178,7 @@ class Processor():
             'rng_state': self.rng.save_rng_state(),
         }, save_path)
 
-    def loading(self):
+    def load_model(self):
         self.device.set_device(self.arg.device)
         print("Loading model")
         model_class = import_class(self.arg.model)
@@ -187,7 +197,6 @@ class Processor():
         model = self.model_to_device(model)
         self.kernel_sizes = model.conv1d.kernel_size
         print("Loading model finished.")
-        self.load_data()
         return model, optimizer
 
     def model_to_device(self, model):
@@ -244,9 +253,9 @@ class Processor():
         if self.arg.dataset == 'CSL':
             dataset_list = zip(["train", "dev"], [True, False])
         elif 'phoenix' in self.arg.dataset:
-            dataset_list = zip(["train", "dev", "test"], [True, False, False]) 
+            dataset_list = zip(["train", "train_eval", "dev", "test"], [True, False, False, False]) 
         elif self.arg.dataset == 'CSL-Daily':
-            dataset_list = zip(["train", "dev", "test"], [True, False, False])
+            dataset_list = zip(["train", "train_eval", "dev", "test"], [True, False, False, False])
         for idx, (mode, train_flag) in enumerate(dataset_list):
             arg = self.arg.feeder_args
             arg["prefix"] = self.arg.dataset_info['dataset_root']
@@ -264,6 +273,8 @@ class Processor():
             shuffle=train_flag,
             drop_last=train_flag,
             num_workers=self.arg.num_worker,  # if train_flag else 0
+            prefetch_factor=1,
+            persistent_workers=False,
             collate_fn=self.feeder.collate_fn,
             pin_memory=True,
             worker_init_fn=self.init_fn,
@@ -297,5 +308,5 @@ if __name__ == '__main__':
     with open(f"./configs/{args.dataset}.yaml", 'r') as f:
         args.dataset_info = yaml.load(f, Loader=yaml.FullLoader)
     processor = Processor(args)
-    utils.pack_code("./", args.work_dir)
+    # utils.pack_code("./", args.work_dir)
     processor.start()

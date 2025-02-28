@@ -140,7 +140,7 @@ if __name__ == "__main__":
     # Define model and load state-dict
     model = SLRModel( num_classes=len(gloss_dict)+1, c2d_type='resnet18', conv_type=2, use_bn=1, gloss_dict=gloss_dict,
                 loss_weights={'ConvCTC': 1.0, 'SeqCTC': 1.0, 'Dist': 25.0},   )
-    state_dict = torch.load(model_weights)['model_state_dict']
+    state_dict = torch.load(model_weights, weights_only=True)['model_state_dict']
     state_dict = OrderedDict([(k.replace('.module', ''), v) for k, v in state_dict.items()])
     model.load_state_dict(state_dict, strict=True)
     model = model.to(device.output_device)
