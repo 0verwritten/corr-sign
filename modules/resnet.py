@@ -168,7 +168,7 @@ class BasicBlock(nn.Module):
         self.bn1 = nn.BatchNorm3d(planes)
         self.relu = nn.ReLU(inplace=True)
         self.conv2 = conv3x3(planes, planes)
-        self.bn2 = nn.BatchNorm3d(planes)
+        self.bn2 = nn.BatchNorm3d(planes) # 87.3MiB
         self.downsample = downsample
         self.stride = stride
 
@@ -176,10 +176,10 @@ class BasicBlock(nn.Module):
         residual = x
 
         out = self.conv1(x)
-        out = self.bn1(out)
+        out = self.bn1(out) # 87.3MiB
         out = self.relu(out)
 
-        out = self.conv2(out)
+        out = self.conv2(out) # 87.3MiB
         out = self.bn2(out)
 
         if self.downsample is not None:
@@ -239,30 +239,30 @@ class ResNet(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        N, C, T, H, W = x.size()
-        x = self.conv1(x)
-        x = self.bn1(x)
+        x = self.conv1(x) # + 340 mb
+        x = self.bn1(x) # + 349 mb
         x = self.relu(x)
-        x = self.maxpool(x)
-
-        x = self.layer1(x)
-        x = self.layer2(x) 
-        x = x + self.corr2(x) * self.alpha[0]
-        x = x + self.temporal_weight2(x)
-        x = self.layer3(x)
-        x = x + self.corr3(x) * self.alpha[1]
-        x = x + self.temporal_weight3(x)
-        x = self.layer4(x)
-        x = x + self.corr4(x) * self.alpha[2]
-        x = x + self.temporal_weight4(x)
+        x = self.maxpool(x) # + 87 mb + 246 mb
+        # x = self.conv1(x)
+        # x = checkpoint(self.bn1, x, use_reentrant=False)
+        # x = self.relu(x)
+        # x = checkpoint(self.maxpool, x, use_reentrant=False)
+        x = checkpoint(self.layer1, x, use_reentrant=False)
+        x = checkpoint(self.layer2, x, use_reentrant=False)
+        x = x + checkpoint(self.corr2, x, use_reentrant=False) * self.alpha[0]
+        x = x + checkpoint(self.temporal_weight2, x, use_reentrant=False)
+        x = checkpoint(self.layer3, x, use_reentrant=False)
+        x = x + checkpoint(self.corr3, x, use_reentrant=False) * self.alpha[1]
+        x = x + checkpoint(self.temporal_weight3, x, use_reentrant=False)
+        x = checkpoint(self.layer4, x, use_reentrant=False)
+        x = x + checkpoint(self.corr4, x, use_reentrant=False) * self.alpha[2]
+        x = x + checkpoint(self.temporal_weight4, x, use_reentrant=False)
     
         x = x.transpose(1,2).contiguous()
         x = x.view((-1,)+x.size()[2:]) #bt,c,h,w
 
-        x = self.avgpool(x)
-        x = x.view(x.size(0), -1) #bt,c
-        x = self.fc(x) #bt,c
-
+        x = self.avgpool(x.view((-1,) + x.size()[2:]))
+        x = self.fc(x.view(x.size(0), -1))
         return x
 
 def resnet18(**kwargs):
