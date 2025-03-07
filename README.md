@@ -146,12 +146,8 @@ Acceptable paramters:
 - `max_frames_num`, the max input frames sampled from an input video, default=360.
 
 ### Demo
-We provide a demo to allow deploying continuous sign language recognition models locally to test its effects. The demo page is shown as follows.
-<div align=center>
-<img width="800" src="./demo.jpg"/>
-<h4> The page of our demo</h4>
-</div>
-The demo video can be found in the top of this page. An example command is 
+We provide a demo to allow deploying continuous sign language recognition models locally to test its effects.
+The demo video can be found in the top of this page. An example command is
 
 `python demo.py --model_path /path_to_pretrained_weights --device your_device`
 
