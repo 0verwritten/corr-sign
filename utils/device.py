@@ -13,10 +13,10 @@ class GpuDataParallel(object):
         device = str(device)
         if device != 'None':
             self.gpu_list = [i for i in range(len(device.split(',')))]
-            os.environ["CUDA_VISIBLE_DEVICES"] = device
+            # os.environ["CUDA_VISIBLE_DEVICES"] = device
             output_device = self.gpu_list[0]
             self.occupy_gpu(self.gpu_list)
-        self.output_device = output_device if len(self.gpu_list) > 0 else "cpu"
+        self.output_device = f"cuda:{output_device}" if len(self.gpu_list) > 0 else "cpu"
 
     def model_to_device(self, model):
         # model = convert_model(model)

@@ -23,8 +23,10 @@ from torch.utils.data.sampler import Sampler
 sys.path.append("..")
 global kernel_sizes 
 
+
+
 class BaseFeeder(data.Dataset):
-    def __init__(self, prefix, gloss_dict, dataset='phoenix2014', drop_ratio=1, num_gloss=-1, mode="train", transform_mode=True,
+    def __init__(self, prefix, gloss_dict: dict[str, list[int]], dataset='phoenix2014', drop_ratio=1, num_gloss=-1, mode="train", transform_mode=True,
                  datatype="lmdb", frame_interval=1, image_scale=1.0, kernel_size=1, input_size=224):
         self.mode = mode
         self.ng = num_gloss
@@ -46,11 +48,12 @@ class BaseFeeder(data.Dataset):
 
     def __getitem__(self, idx):
         if self.data_type == "video":
-            input_data, label, fi = self.read_video(idx)
+            input_data, label = self.read_video(idx)
             input_data, label = self.normalize(input_data, label)
             # input_data, label = self.normalize(input_data, label, fi['fileid'])
             return input_data, torch.LongTensor(label), self.inputs_list[idx]['original_info']
         elif self.data_type == "lmdb":
+            raise NotImplementedError()
             input_data, label, fi = self.read_lmdb(idx)
             input_data, label = self.normalize(input_data, label)
             return input_data, torch.LongTensor(label), self.inputs_list[idx]['original_info']
@@ -60,22 +63,22 @@ class BaseFeeder(data.Dataset):
 
     def read_video(self, index):
         # load file info
-        fi = self.inputs_list[index]
+        file_info = self.inputs_list[index]
         if 'phoenix' in self.dataset:
-            img_folder = os.path.join(self.prefix, "features/fullFrame-256x256px/" + fi['folder'])  
+            img_folder = os.path.join(self.prefix, "features/fullFrame-256x256px/" + file_info['folder'])  
         elif self.dataset == 'CSL':
-            img_folder = os.path.join(self.prefix, "features/fullFrame-256x256px/" + fi['folder'] + "/*.jpg")
+            img_folder = os.path.join(self.prefix, "features/fullFrame-256x256px/" + file_info['folder'] + "/*.jpg")
         elif self.dataset == 'CSL-Daily':
-            img_folder = os.path.join(self.prefix, fi['folder'])
+            img_folder = os.path.join(self.prefix, file_info['folder'])
         img_list = sorted(glob.glob(img_folder))
         img_list = img_list[int(torch.randint(0, self.frame_interval, [1]))::self.frame_interval]
-        label_list = []
-        for phase in fi['label'].split(" "):
+        label_list: list[int] = []
+        for phase in file_info['label'].split(" "):
             if phase == '':
                 continue
             if phase in self.dict.keys():
                 label_list.append(self.dict[phase][0])
-        return [cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB) for img_path in img_list], label_list, fi
+        return [cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB) for img_path in img_list], label_list
 
     def read_features(self, index):
         # load file info
@@ -85,7 +88,7 @@ class BaseFeeder(data.Dataset):
 
     def normalize(self, video, label, file_id=None):
         video, label = self.data_aug(video, label, file_id)
-        video = video.float() / 127.5 - 1
+        video = video.float() / 127.5 - 1 # made each pixel from -1 to 1 (moved from range 0 to 255)
         return video, label
 
     def transform(self):
@@ -107,15 +110,6 @@ class BaseFeeder(data.Dataset):
                 video_augmentation.Resize(self.image_scale),
                 video_augmentation.ToTensor(),
             ])
-
-    def byte_to_img(self, byteflow):
-        unpacked = pa.deserialize(byteflow)
-        imgbuf = unpacked[0]
-        buf = six.BytesIO()
-        buf.write(imgbuf)
-        buf.seek(0)
-        img = Image.open(buf).convert('RGB')
-        return img
 
     @staticmethod
     def collate_fn(batch):

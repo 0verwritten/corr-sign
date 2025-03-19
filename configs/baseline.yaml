@@ -1,19 +1,24 @@
 feeder: dataset.dataloader_video.BaseFeeder
-phase: train
+phase: dev
 dataset: phoenix2014
-# dataset: phoenix14-si5
-num_epoch: 40
-work_dir: ./work_dir/baseline_res18/
-batch_size: 2
-random_seed: 0
-test_batch_size: 2
+# dataset: phoenix14-si5  #CSL-Daily, phoenix2014-T, phoenix2014, CSL
+num_epoch: 15
+# load_checkpoints: tmpdev_100.00_epoch0_model.pt
+load_checkpoints: "/home/maveric/Downloads/dev_18.90_PHOENIX14.pt"
+work_dir: ./tmp
+# work_dir: ./dataset/phoenix2014
+# work_dir: ./work_dir/baseline_res18/
+batch_size: 1
+# random_seed: 0
+test_batch_size: 1
 num_worker: 10
-device: 0,1
+device: 'cuda'
 log_interval: 10000
-eval_interval: 1
-save_interval: 5
+eval_interval: 5
+save_interval: 1
 # python in default
-evaluate_tool: sclite
+evaluate_tool: python
+# evaluate_tool: sclite
 loss_weights:
   SeqCTC: 1.0
   # VAC
@@ -31,7 +36,7 @@ optimizer_args:
   nesterov: False
 
 feeder_args:
-  mode: 'train'
+  mode: 'dev'
   datatype: 'video'
   num_gloss: -1
   drop_ratio: 1.0
@@ -40,7 +45,8 @@ feeder_args:
   input_size: 224
 
 model: slr_network.SLRModel
-decode_mode: beam
+# decode_mode: beam 
+decode_mode: max
 model_args:
   num_classes: 1296
   c2d_type: resnet18 #resnet18, mobilenet_v2, squeezenet1_1, shufflenet_v2_x1_0, efficientnet_b1, mnasnet1_0, regnet_y_800mf, vgg16_bn, vgg11_bn, regnet_x_800mf, regnet_x_400mf, densenet121, regnet_y_1_6gf

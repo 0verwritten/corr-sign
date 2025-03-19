@@ -1,4 +1,55 @@
 import argparse
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Any, Callable
+
+@dataclass
+class ConfigArgs:
+    # general settings
+    work_dir: str = './work_dir/temp'
+    config: str = './configs/baseline.yaml'
+    random_fix: bool = True
+    # device is defined as str in the parser, so we use str here (even though its default is 0)
+    device: str = "0"
+    
+    # processor
+    phase: str = 'train'
+    
+    # debug settings
+    save_interval: int = 200
+    random_seed: int = 0
+    eval_interval: int = 100
+    print_log: bool = True
+    log_interval: int = 20
+    evaluate_tool: str = "python"
+    
+    # feeder configuration
+    feeder: str = 'dataloader_video.BaseFeeder'
+    dataset: Optional[str] = None
+    dataset_info: Dict[str, Any] = field(default_factory=dict)
+    num_worker: int = 4
+    feeder_args: Dict[str, Any] = field(default_factory=dict)
+    
+    # model settings
+    model: Optional[str] = None
+    model_args: Dict[str, Any] = field(default_factory=dict)
+    load_weights: Optional[str] = None
+    load_checkpoints: Optional[str] = None
+    decode_mode: str = "max"
+    ignore_weights: List[str] = field(default_factory=list)
+    
+    # optimization and training
+    batch_size: int = 16
+    test_batch_size: int = 8
+    loss_weights: Dict[str, float] = field(default_factory=lambda: {"SeqCTC": 1.0})
+    optimizer_args: Dict[str, Any] = field(default_factory=lambda: {
+        "base_lr": 1e-2,
+        "optimizer": "SGD",
+        "nesterov": False,
+        "step": [5, 10],
+        "weight_decay": 0.00005,
+        "start_epoch": 1,
+    })
+    num_epoch: int = 80
 
 
 def get_parser():

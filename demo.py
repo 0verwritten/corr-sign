@@ -98,7 +98,11 @@ def run_inference(inputs):
 
     vid = device.data_to_device(vid)
     vid_lgt = device.data_to_device(video_length)
-    ret_dict = model(vid, vid_lgt, label=None, label_lgt=None)
+    try:
+        ret_dict = model(vid, vid_lgt, label=None, label_lgt=None)
+    except Exception as e:
+        torch.cuda.empty_cache()
+        raise ValueError(f"Error {e} in running inference")
     return ret_dict['recognized_sents'] # [[('ICH', 0), ('LUFT', 1), ('WETTER', 2), ('GERADE', 3), ('loc-SUEDWEST', 4), ('TEMPERATUR', 5), ('__PU__', 6), ('KUEHL', 7), ('SUED', 8), ('WARM', 9), ('ICH', 10), ('IX', 11)]]
 
 
@@ -122,6 +126,7 @@ if __name__ == "__main__":
     model_path = os.path.expanduser(args.model_path)
     
     device_id = args.device  # specify which gpu to use
+    args.language = "phoenix"
     if args.language == 'phoenix':
         dataset = 'phoenix2014' 
     elif args.language == 'csl':
@@ -140,7 +145,7 @@ if __name__ == "__main__":
     # Define model and load state-dict
     model = SLRModel( num_classes=len(gloss_dict)+1, c2d_type='resnet18', conv_type=2, use_bn=1, gloss_dict=gloss_dict,
                 loss_weights={'ConvCTC': 1.0, 'SeqCTC': 1.0, 'Dist': 25.0},   )
-    state_dict = torch.load(model_weights)['model_state_dict']
+    state_dict = torch.load(model_weights, weights_only=False)['model_state_dict']
     state_dict = OrderedDict([(k.replace('.module', ''), v) for k, v in state_dict.items()])
     model.load_state_dict(state_dict, strict=True)
     model = model.to(device.output_device)

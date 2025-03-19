@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.utils.model_zoo as model_zoo
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+
 __all__ = [
     'ResNet', 'resnet10', 'resnet18', 'resnet34', 'resnet50', 'resnet101',
     'resnet152', 'resnet200'
@@ -14,6 +16,8 @@ model_urls = {
     'resnet152': 'https://download.pytorch.org/models/resnet152-b121ed2d.pth',
 }
 
+def checkpoint1(func, *args, **kwargs):
+    return func(*args)
 
 class Get_Correlation(nn.Module):
     def __init__(self, channels):
@@ -136,17 +140,17 @@ class ResNet(nn.Module):
     def forward(self, x):
         N, C, T, H, W = x.size()
         x = self.conv1(x)
-        x = self.bn1(x)
+        x = checkpoint(self.bn1, x, use_reentrant=False)
         x = self.relu(x)
-        x = self.maxpool(x)
+        x = checkpoint(self.maxpool, x, use_reentrant=False)
 
-        x = self.layer1(x)
-        x = self.layer2(x) 
-        x = x + self.corr1(x) * self.alpha[0]
-        x = self.layer3(x)
-        x = x + self.corr2(x) * self.alpha[1]
-        x = self.layer4(x)
-        x = x + self.corr3(x) * self.alpha[2]
+        x = checkpoint(self.layer1, x, use_reentrant=False)
+        x = checkpoint(self.layer2, x, use_reentrant=False)
+        x = x + checkpoint(self.corr1, x, use_reentrant=False) * self.alpha[0]
+        x = checkpoint(self.layer3, x, use_reentrant=False)
+        x = x + checkpoint1(self.corr2, x, use_reentrant=False) * self.alpha[1]
+        x = checkpoint1(self.layer4, x, use_reentrant=False)
+        x = x + checkpoint1(self.corr3, x, use_reentrant=False) * self.alpha[2]
         x = x.transpose(1,2).contiguous()
         x = x.view((-1,)+x.size()[2:]) #bt,c,h,w
 
@@ -173,6 +177,12 @@ def resnet34(**kwargs):
     """Constructs a ResNet-34 model.
     """
     model = ResNet(BasicBlock, [3, 4, 6, 3], **kwargs)
+    checkpoint = model_zoo.load_url(model_urls['resnet34'])
+    layer_name = list(checkpoint.keys())
+    for ln in layer_name :
+        if 'conv' in ln or 'downsample.0.weight' in ln:
+            checkpoint[ln] = checkpoint[ln].unsqueeze(2)  
+    model.load_state_dict(checkpoint, strict=False)
     return model
 
 def test():

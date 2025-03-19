@@ -10,6 +10,21 @@ import torchvision.models as models
 from modules.criterions import SeqKD
 from modules import BiLSTMLayer, TemporalConv
 import modules.resnet as resnet
+from typing import List, TypedDict
+from dataclasses import dataclass
+import time
+
+@dataclass
+class ModelOutput(TypedDict):
+    """
+    A structured representation of the model's output.
+    """
+    feat_len: List[int]  # Length of each sequence in the batch
+    conv_logits: torch.Tensor  # Logits from the convolutional layer (Batch Size, Time Steps / Sequence Length, Channels / Features per Time Step)
+    sequence_logits: torch.Tensor  # Logits from the sequence model (B, T, C)
+    conv_sents: List[str]  # Sentences predicted by the convolutional model
+    recognized_sents: List[str]  # Final recognized sentences from the model
+
 
 class Identity(nn.Module):
     def __init__(self):
@@ -51,7 +66,8 @@ class SLRModel(nn.Module):
                                    conv_type=conv_type,
                                    use_bn=use_bn,
                                    num_classes=num_classes)
-        self.decoder = utils.Decode(gloss_dict, num_classes, 'beam')
+        # self.decoder = utils.Decode(gloss_dict, num_classes, 'beam')
+        self.decoder = utils.Decode(gloss_dict, num_classes, 'max')
         self.temporal_model = BiLSTMLayer(rnn_type='LSTM', input_size=hidden_size, hidden_size=hidden_size,
                                           num_layers=2, bidirectional=True)
         if weight_norm:
@@ -78,7 +94,7 @@ class SLRModel(nn.Module):
                        for idx, lgt in enumerate(len_x)])
         return x
 
-    def forward(self, x, len_x, label=None, label_lgt=None):
+    def forward(self, x, len_x, label=None, label_lgt=None) -> ModelOutput:
         if len(x.shape) == 5:
             # videos
             batch, temp, channel, height, width = x.shape
@@ -113,20 +129,28 @@ class SLRModel(nn.Module):
 
     def criterion_calculation(self, ret_dict, label, label_lgt):
         loss = 0
+        feat_len = ret_dict["feat_len"].long()
+        label = label.long()
+        label_lgt = label_lgt.long()
+
         for k, weight in self.loss_weights.items():
             if k == 'ConvCTC':
-                loss += weight * self.loss['CTCLoss'](ret_dict["conv_logits"].log_softmax(-1),
-                                                      label.cpu().int(), ret_dict["feat_len"].cpu().int(),
-                                                      label_lgt.cpu().int()).mean()
+                conv_log_probs = ret_dict["conv_logits"].log_softmax(-1)
+                conv_loss = self.loss['CTCLoss'](conv_log_probs, label, feat_len, label_lgt)
+                loss += weight * conv_loss.mean()
+
             elif k == 'SeqCTC':
-                loss += weight * self.loss['CTCLoss'](ret_dict["sequence_logits"].log_softmax(-1),
-                                                      label.cpu().int(), ret_dict["feat_len"].cpu().int(),
-                                                      label_lgt.cpu().int()).mean()
+                seq_log_probs = ret_dict["sequence_logits"].log_softmax(-1)
+                seq_loss = self.loss['CTCLoss'](seq_log_probs, label, feat_len, label_lgt)
+                loss += weight * seq_loss.mean()
+
             elif k == 'Dist':
-                loss += weight * self.loss['distillation'](ret_dict["conv_logits"],
-                                                           ret_dict["sequence_logits"].detach(),
-                                                           use_blank=False)
+                dist_loss = self.loss['distillation'](
+                    ret_dict["conv_logits"], ret_dict["sequence_logits"].detach(), use_blank=False)
+                loss += weight * dist_loss
+
         return loss
+
 
     def criterion_init(self):
         self.loss['CTCLoss'] = torch.nn.CTCLoss(reduction='none', zero_infinity=False)

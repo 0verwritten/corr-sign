@@ -17,14 +17,20 @@ def evaluate(prefix="./", mode="dev", evaluate_dir=None, evaluate_prefix=None,
     os.system(f"python {evaluate_dir}/mergectmstm.py {prefix}tmp2.ctm {prefix}tmp.stm")
     os.system(f"cp {prefix}tmp2.ctm {prefix}out.{output_file}")
     if python_evaluate:
-        ret = wer_calculation(f"{evaluate_dir}/{evaluate_prefix}-{mode}.stm", f"{prefix}out.{output_file}")
-        if triplet:
+        ret, metrics = (
             wer_calculation(
                 f"{evaluate_dir}/{evaluate_prefix}-{mode}.stm",
                 f"{prefix}out.{output_file}",
-                f"{prefix}out.{output_file}".replace(".ctm", "-conv.ctm")
+                f"{prefix}out.{output_file}".replace(".ctm", "-conv.ctm"),
             )
-        return ret
+            if triplet and os.path.exists(f"{prefix}out.{output_file}".replace(".ctm", "-conv.ctm"))
+            else wer_calculation(
+                f"{evaluate_dir}/{evaluate_prefix}-{mode}.stm",
+                f"{prefix}out.{output_file}",
+            )
+        )
+
+        return ret, metrics
     if output_dir is not None:
         if not os.path.isdir(prefix + output_dir):
             os.makedirs(prefix + output_dir)
