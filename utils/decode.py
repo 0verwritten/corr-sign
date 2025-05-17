@@ -41,6 +41,7 @@ class Decode(object):
             decoded_seq, score = self._beam_search_decode_single(probs_i)
             dedup = [token for token, _ in groupby(decoded_seq)]
             ret_list.append([(self.i2g_dict[int(token)], idx) for idx, token in enumerate(dedup)])
+
         return ret_list
 
     def _beam_search_decode_single(self, probs):

@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.utils.model_zoo as model_zoo
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+from torchvision.models import resnet18, ResNet as ResNetLib
+from torchvision.models.resnet import BasicBlock as BasicBlockLib 
 
 __all__ = [
     'ResNet', 'resnet10', 'resnet18', 'resnet34', 'resnet50', 'resnet101',
@@ -160,7 +162,7 @@ class ResNet(nn.Module):
 
         return x
 
-def resnet18(**kwargs):
+def resnet18_3d(**kwargs):
     """Constructs a ResNet-18 based model.
     """
     model = ResNet(BasicBlock, [2, 2, 2, 2], **kwargs)
@@ -168,12 +170,12 @@ def resnet18(**kwargs):
     layer_name = list(checkpoint.keys())
     for ln in layer_name :
         if 'conv' in ln or 'downsample.0.weight' in ln:
-            checkpoint[ln] = checkpoint[ln].unsqueeze(2)  
+            checkpoint[ln] = checkpoint[ln]#.unsqueeze(2)  
     model.load_state_dict(checkpoint, strict=False)
     return model
 
 
-def resnet34(**kwargs):
+def resnet34_3d(**kwargs):
     """Constructs a ResNet-34 model.
     """
     model = ResNet(BasicBlock, [3, 4, 6, 3], **kwargs)
@@ -181,13 +183,31 @@ def resnet34(**kwargs):
     layer_name = list(checkpoint.keys())
     for ln in layer_name :
         if 'conv' in ln or 'downsample.0.weight' in ln:
-            checkpoint[ln] = checkpoint[ln].unsqueeze(2)  
+            checkpoint[ln] = checkpoint[ln]#.unsqueeze(2)  
     model.load_state_dict(checkpoint, strict=False)
     return model
 
-def test():
-    net = resnet18()
-    y = net(torch.randn(1,3,224,224))
-    print(y.size())
+def resnet18(**kwargs):
+    """Constructs a ResNet-18 based model.
+    """
+    model = ResNetLib(BasicBlockLib, [2, 2, 2, 2], **kwargs)
+    checkpoint = model_zoo.load_url(model_urls['resnet18'])
+    layer_name = list(checkpoint.keys())
+    for ln in layer_name :
+        if 'conv' in ln or 'downsample.0.weight' in ln:
+            checkpoint[ln] = checkpoint[ln]#.unsqueeze(2)  
+    model.load_state_dict(checkpoint, strict=False)
+    return model
 
-#test()
+
+def resnet34(**kwargs):
+    """Constructs a ResNet-34 model.
+    """
+    model = ResNetLib(BasicBlockLib, [3, 4, 6, 3], **kwargs)
+    checkpoint = model_zoo.load_url(model_urls['resnet34'])
+    layer_name = list(checkpoint.keys())
+    for ln in layer_name :
+        if 'conv' in ln or 'downsample.0.weight' in ln:
+            checkpoint[ln] = checkpoint[ln]#.unsqueeze(2)  
+    model.load_state_dict(checkpoint, strict=False)
+    return model

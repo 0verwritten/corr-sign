@@ -129,3 +129,54 @@ if __name__ == '__main__':
     for idx, (key, value) in enumerate(sign_dict):
         save_dict[key] = [idx + 1, value]
     np.save(f"./{args.dataset}/gloss_dict.npy", save_dict)
+
+    top_highest = sorted(sign_dict, key=lambda x: x[1], reverse=True)
+
+    # print(top_highest[50:])
+
+    import matplotlib.pyplot as plt
+
+    # Plot the distribution of gloss frequencies without labels
+    frequencies = [value for key, value in top_highest]
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(frequencies, color='skyblue', marker='o')
+    plt.ylabel('Frequencies')
+    plt.title('Distribution of Gloss Frequencies')
+    plt.tight_layout()
+
+    # Save the plot before showing
+    plt.savefig(f"./{args.dataset}/gloss_distribution_no_labels.png")
+    plt.show()
+
+    # import IPython as ipy; ipy.embed()
+
+    # Group top_highest into ranges of 50 (1-50, 51-100, etc.) and calculate total frequency
+    range_groups = {}
+    for key, value in top_highest:
+        # Determine which range this value belongs to
+        range_start = 1 if value < 50 else ((value - 1) // 50 * 50 + 1)
+        range_end = range_start + 49
+        range_key = f"{range_start}-{range_end}"
+        
+        # Add the actual frequency value to the total for this range
+        if range_key not in range_groups:
+            range_groups[range_key] = value
+        else:
+            range_groups[range_key] += value
+
+    # Sort the ranges naturally
+    sorted_ranges = sorted(range_groups.items(), key=lambda x: int(x[0].split('-')[0]))
+
+    # Plot the grouped data
+    range_labels, total_frequencies = zip(*sorted_ranges)
+    plt.figure(figsize=(12, 6))
+    plt.bar(range_labels, total_frequencies, color='skyblue')
+    plt.xlabel('Gloss Frequency Range')
+    plt.ylabel('Total Frequency (sum of values in range)')
+    plt.title('Total Gloss Frequency by Range (Number of times × Value)')
+    plt.xticks(rotation=45, ha='right')
+    plt.tight_layout()
+    # Save the plot before showing
+    plt.savefig(f"./{args.dataset}/gloss_frequency_grouped_ranges_snowball.png")
+    plt.show()

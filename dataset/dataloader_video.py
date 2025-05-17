@@ -9,7 +9,8 @@ import torch
 import random
 import pandas
 import warnings
-
+from torchvision import transforms
+import torch.nn.functional as F
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 import numpy as np
@@ -66,18 +67,20 @@ class BaseFeeder(data.Dataset):
         file_info = self.inputs_list[index]
         if 'phoenix' in self.dataset:
             img_folder = os.path.join(self.prefix, "features/fullFrame-256x256px/" + file_info['folder'])  
-        elif self.dataset == 'CSL':
-            img_folder = os.path.join(self.prefix, "features/fullFrame-256x256px/" + file_info['folder'] + "/*.jpg")
-        elif self.dataset == 'CSL-Daily':
-            img_folder = os.path.join(self.prefix, file_info['folder'])
+        elif self.dataset == 'how2sign':
+            img_folder = os.path.join(self.prefix, file_info['folder'] + '/*')
         img_list = sorted(glob.glob(img_folder))
         img_list = img_list[int(torch.randint(0, self.frame_interval, [1]))::self.frame_interval]
         label_list: list[int] = []
-        for phase in file_info['label'].split(" "):
+        tokens = file_info["tokens"] if 'tokens' in file_info else file_info['label'].split(" ")
+        for phase in tokens:
             if phase == '':
                 continue
             if phase in self.dict.keys():
                 label_list.append(self.dict[phase][0])
+        
+        if len(img_list) == 0: raise f"NO IMAGE UNDER {img_folder} path"
+
         return [cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB) for img_path in img_list], label_list
 
     def read_features(self, index):
@@ -87,28 +90,35 @@ class BaseFeeder(data.Dataset):
         return data['features'], data['label']
 
     def normalize(self, video, label, file_id=None):
-        video, label = self.data_aug(video, label, file_id)
-        video = video.float() / 127.5 - 1 # made each pixel from -1 to 1 (moved from range 0 to 255)
+        video = self.data_aug(video)
+        # video = video.float() / 127.5 - 1 # made each pixel from -1 to 1 (moved from range 0 to 255)
+        T = video.size(0)
+        # print("adding padding", T)
+        # if T < 2592:
+        #     pad_size = 2592 - T
+        #     padding = (0, 0, 0, 0, 0, 0, 0, pad_size)  # Pad at end of time dimension
+        #     video = F.pad(video, padding, mode='constant', value=0)
+        # print(video.shape)
+
         return video, label
 
     def transform(self):
         if self.transform_mode == "train":
             print("Apply training transform.")
-            return video_augmentation.Compose([
-                # video_augmentation.CenterCrop(224),
-                # video_augmentation.WERAugment('/lustre/wangtao/current_exp/exp/baseline/boundary.npy'),
+            return transforms.Compose([
                 video_augmentation.RandomCrop(self.input_size),
-                video_augmentation.RandomHorizontalFlip(0.5),
                 video_augmentation.Resize(self.image_scale),
                 video_augmentation.ToTensor(),
                 video_augmentation.TemporalRescale(0.2, self.frame_interval),
+                video_augmentation.NormalizeVideo(),
             ])
         else:
             print("Apply testing transform.")
-            return video_augmentation.Compose([
+            return transforms.Compose([
                 video_augmentation.CenterCrop(self.input_size),
                 video_augmentation.Resize(self.image_scale),
                 video_augmentation.ToTensor(),
+                video_augmentation.NormalizeVideo(),
             ])
 
     @staticmethod

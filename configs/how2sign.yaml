@@ -1,0 +1,4 @@
+dataset_root: ./dataset/how2sign
+dict_path: ./preprocess/how2sign/gloss_dict.npy # dictionary with gloss as key and [index, frequency] as value
+evaluation_dir: ./evaluation/slr_h2sign_eval
+evaluation_prefix: how2sign-groundtruth

@@ -31,68 +31,41 @@ def seq_train(
     optimizer: utils.Optimizer,
     device: GpuDataParallel,
     epoch_idx: int,
-    recoder: utils.Recorder,
+    recorder: utils.Recorder,
 ):
     model.train()
-    loss_value = []
-    clr = [group['lr'] for group in optimizer.optimizer.param_groups]
+    losses = []
     scaler = GradScaler(device.output_device)
-    accumulation_steps = 2  # Accumulate gradients over 2 batches
+    learning_rates = [group['lr'] for group in optimizer.optimizer.param_groups]
 
-    try:
-        # start_time = time.time()
-        for batch_idx, data in enumerate(tqdm(loader, desc='Training epoch {}'.format(epoch_idx))):
-            # print(
-            #     f"Batch {batch_idx}: ",
-            #     list([x.shape if "shape" in dir(x) else x for x in data[:2]]),
-            # )
-            # continue
-            # with torch.autograd.profiler.profile(use_cuda=True) as prof:
-            vid = device.data_to_device(data[0])
-            vid_len_per_item = device.data_to_device(data[1])
-            label = device.data_to_device(data[2])
-            label_len_per_item = device.data_to_device(data[3])
+    for batch_idx, data in enumerate(tqdm(loader, desc=f"Training Epoch {epoch_idx}")):
+        try:
+            torch.cuda.empty_cache()
+            vid, vid_len, label, label_len = [device.data_to_device(x) for x in data[:4]]
 
             optimizer.zero_grad()
             with autocast(device.output_device):
-                ret_dict = model(vid, vid_len_per_item, label=label, label_lgt=label_len_per_item)
-                loss = model.criterion_calculation(ret_dict, label, label_len_per_item)
-            if np.isinf(loss.item()) or np.isnan(loss.item()):
-                print('loss is nan')
-                print(str(data[1])+'  frames')
-                print(str(data[3])+'  glosses')
+                ret = model(vid, vid_len, label=label, label_lgt=label_len)
+                loss = model.criterion_calculation(ret, label, label_len)
+
+            if not torch.isfinite(loss):
+                print(f"Skipping batch {batch_idx} due to invalid loss.")
                 continue
 
             scaler.scale(loss).backward()
             scaler.step(optimizer.optimizer)
             scaler.update()
 
-            # if (batch_idx + 1) % accumulation_steps == 0:
-            #     optimizer.zero_grad()
+            losses.append(loss.item())
 
-            loss_value.append(loss)
-            del ret_dict, vid, vid_len_per_item, label, label_len_per_item
-            torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"Exception at batch {batch_idx}: {e}")
+            print(traceback.format_exc())
+            raise
 
-            # print(prof.key_averages().table(sort_by="cuda_time_total"))
-    except Exception as e:
-        print(
-            f"Batch {batch_idx}: ",
-            list([x.shape if "shape" in dir(x) else x for x in data]),
-        )
-        print(e)
-        raise
-
-    recoder.print_log(
-        '\tEpoch: {}, Batch({}/{}) done. Loss: {:.8f}  lr:{:.6f}'
-            .format(epoch_idx, batch_idx, len(loader), loss.cpu().item(), clr[0]))
-
-    loss_value = [x.cpu().item() for x in loss_value]
-
+    recorder.log(f'\tEpoch {epoch_idx}: Loss: {np.mean(losses):.6f}, LR: {learning_rates[0]:.6f}')
     optimizer.scheduler.step()
-    recoder.print_log('\tMean training loss: {:.10f}.'.format(np.mean(loss_value)))
-    return 
-
+    return
 
 def seq_eval(
     cfg: ConfigArgs,
@@ -102,125 +75,98 @@ def seq_eval(
     mode: str,
     epoch: int,
     work_dir: str,
-    recoder: utils.Recorder,
+    recorder: utils.Recorder,
     evaluate_tool="python",
 ):
     model.eval()
-    total_sent: list[str] = [None] * len(loader)
-    total_info = [None] * len(loader)
-    total_conv_sent = [None] * len(loader)
-    stat = {i: [0, 0] for i in range(len(loader.dataset.dict))}
-    for batch_idx, data in enumerate(tqdm(loader, desc='Validating epoch {}'.format(epoch))):
+    num_batches = len(loader)
+    total_info, total_sents, total_conv_sents = [None] * num_batches, [None] * num_batches, [None] * num_batches
+
+    for batch_idx, data in enumerate(tqdm(loader, desc=f"Validating Epoch {epoch}")):
         file_info = data[4]
-        # if batch_idx > 4:
-        #     total_info[batch_idx] = [file_name.split("|")[0] for file_name in file_info]
-        #     total_sent[batch_idx] = total_sent[batch_idx-1]
-        #     total_conv_sent[batch_idx] = total_conv_sent[batch_idx -1]
-        #     continue
-        recoder.record_timer("device")
-        vid = device.data_to_device(data[0])
-        vid_lgt = device.data_to_device(data[1])
-        label = device.data_to_device(data[2])
-        label_lgt = device.data_to_device(data[3])
-
+        vid, vid_len, label, label_len = [device.data_to_device(x) for x in data[:4]]
         with torch.no_grad():
-            ret_dict: ModelOutput = model(vid, vid_lgt, label=label, label_lgt=label_lgt)
+            ret = model(vid, vid_len, label=label, label_lgt=label_len)
 
-        total_info[batch_idx] = [file_name.split("|")[0] for file_name in file_info]
-        total_sent[batch_idx] = ret_dict['recognized_sents']
-        total_conv_sent[batch_idx] = ret_dict['conv_sents']
+        total_info[batch_idx] = [f.split("|")[0] for f in file_info]
+        total_sents[batch_idx] = ret['recognized_sents']
+        total_conv_sents[batch_idx] = ret['conv_sents']
+
+    if evaluate_tool != "python":
+        raise NotImplementedError("Only Python evaluation is supported.")
+
     try:
-        python_eval = True if evaluate_tool == "python" else False
+        write2file(os.path.join(work_dir, f"output-hypothesis-{mode}.ctm"), total_info, total_sents)
+        write2file(os.path.join(work_dir, f"output-hypothesis-{mode}-conv.ctm"), total_info, total_conv_sents)
 
-        if (not python_eval):
-            print("\nOnly python evaluation is supported.\n")
-            raise NotImplementedError("Only python evaluation is supported.")
-
-        write2file(work_dir + "output-hypothesis-{}.ctm".format(mode), total_info, total_sent)
-        write2file(work_dir + "output-hypothesis-{}-conv.ctm".format(mode), total_info, total_conv_sent)
-        # conv_ret, _ = evaluate(
-        #     prefix=work_dir, mode=mode, output_file="output-hypothesis-{}-conv.ctm".format(mode),
-        #     evaluate_dir=cfg.dataset_info['evaluation_dir'],
-        #     evaluate_prefix=cfg.dataset_info['evaluation_prefix'],
-        #     output_dir="epoch_{}_result/".format(epoch),
-        #     python_evaluate=python_eval,
-        # )
-
-        lstm_ret, metrics = evaluate(
-            prefix=work_dir, mode=mode, output_file="output-hypothesis-{}.ctm".format(mode),
+        score, metrics = evaluate(
+            prefix=work_dir,
+            mode=mode,
+            output_file=f"output-hypothesis-{mode}.ctm",
             evaluate_dir=cfg.dataset_info['evaluation_dir'],
             evaluate_prefix=cfg.dataset_info['evaluation_prefix'],
-            output_dir="epoch_{}_result/".format(epoch),
-            python_evaluate=python_eval,
+            output_dir=f"epoch_{epoch}_result/",
+            python_evaluate=True,
             triplet=True,
         )
 
-        with open(join(work_dir, "output-hypothesis-{}-epoch-{}-metrics.json".format(mode, epoch)), "w") as f:
+        metrics_path = os.path.join(work_dir, f"output-hypothesis-{mode}-epoch-{epoch}-metrics.json")
+        with open(metrics_path, "w") as f:
             json.dump(metrics, f)
 
-        # del conv_ret
     except Exception:
-        print("Unexpected error:", traceback.format_exc())
-        lstm_ret = 100.0
+        print("Evaluation failed.")
+        print(traceback.format_exc())
+        score = 100.0
 
-    del total_sent
-    del total_info
-    del total_conv_sent
-    del vid
-    del vid_lgt
-    del label
-    del label_lgt
-    recoder.print_log(f"Epoch {epoch}, {mode} {lstm_ret: 2.2f}%", f"{work_dir}/{mode}.txt")
-    return lstm_ret
+    recorder.log(f"Epoch {epoch}, {mode} WER: {score:.2f}%", os.path.join(work_dir, f"{mode}.txt"))
+    return score
 
-
-def seq_feature_generation(loader, model, device, mode, work_dir, recoder):
+def seq_feature_generation(loader, model, device, mode, work_dir, recorder):
     model.eval()
 
     src_path = os.path.abspath(f"{work_dir}{mode}")
     tgt_path = os.path.abspath(f"./features/{mode}")
-    if not os.path.exists("./features/"):
-        os.makedirs("./features/")
+    os.makedirs("./features/", exist_ok=True)
 
     if os.path.islink(tgt_path):
-        curr_path = os.readlink(tgt_path)
-        if work_dir[1:] in curr_path and os.path.isabs(curr_path):
+        if work_dir[1:] in os.readlink(tgt_path) and os.path.isabs(os.readlink(tgt_path)):
             return
-        else:
-            os.unlink(tgt_path)
-    else:
-        if os.path.exists(src_path) and len(loader.dataset) == len(os.listdir(src_path)):
-            os.symlink(src_path, tgt_path)
-            return
+        os.unlink(tgt_path)
 
-    for batch_idx, data in tqdm(enumerate(loader)):
-        recoder.record_timer("device")
-        vid = device.data_to_device(data[0])
-        vid_lgt = device.data_to_device(data[1])
+    if os.path.exists(src_path) and len(loader.dataset) == len(os.listdir(src_path)):
+        os.symlink(src_path, tgt_path)
+        return
+
+    os.makedirs(src_path, exist_ok=True)
+
+    for batch_idx, data in tqdm(enumerate(loader), total=len(loader)):
+        vid, vid_len = device.data_to_device(data[0]), device.data_to_device(data[1])
+        labels, label_lens, file_infos = data[2], data[3], data[4]
+
         with torch.no_grad():
-            ret_dict = model(vid, vid_lgt)
-        if not os.path.exists(src_path):
-            os.makedirs(src_path)
+            ret = model(vid, vid_len)
+
         start = 0
-        for sample_idx in range(len(vid)):
-            end = start + data[3][sample_idx]
-            filename = f"{src_path}/{data[-1][sample_idx].split('|')[0]}_features.npy"
-            save_file = {
-                "label": data[2][start:end],
-                "features": ret_dict['framewise_features'][sample_idx][:, :vid_lgt[sample_idx]].T.cpu().detach(),
-            }
-            np.save(filename, save_file)
+        for idx, file_name in enumerate(file_infos):
+            end = start + label_lens[idx]
+            file_base = file_name.split('|')[0]
+            save_path = os.path.join(src_path, f"{file_base}_features.npy")
+
+            np.save(save_path, {
+                "label": labels[start:end],
+                "features": ret['framewise_features'][idx][:, :vid_len[idx]].T.cpu().numpy(),
+            })
+
             start = end
-        assert end == len(data[2])
+        assert start == len(labels)
+
     os.symlink(src_path, tgt_path)
 
 
 def write2file(path, info, output):
-    filereader = open(path, "w")
-    for sample_idx, sample in enumerate(output):
-        for word_idx, word in enumerate(sample):
-            filereader.writelines(
-                "{} 1 {:.2f} {:.2f} {}\n".format(info[sample_idx],
-                                                 word_idx * 1.0 / 100,
-                                                 (word_idx + 1) * 1.0 / 100,
-                                                 "[EMPTY]" if len(word) == 0 else word[0]))
+    with open(path, "w") as file:
+        for sample_idx, words in enumerate(output):
+            for word_idx, word in enumerate(words):
+                label = "[EMPTY]" if not word else word[0]
+                file.write(f"{info[sample_idx]} 1 {word_idx * 0.01:.2f} {(word_idx + 1) * 0.01:.2f} {label}\n")
