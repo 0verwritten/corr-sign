@@ -22,7 +22,8 @@ class TemporalRescale:
         if (new_len - 4) % 4 != 0:
             new_len += 4 - (new_len - 4) % 4
         index = np.linspace(0, vid_len - 1, new_len).astype(np.int32)
-        return [clip[i] for i in index]
+        rescaled_clip = [clip[i] for i in index]
+        return torch.stack([torch.from_numpy(frame) if isinstance(frame, np.ndarray) else frame for frame in rescaled_clip])
 
 class ToTensor(object):
     def __call__(self, video):

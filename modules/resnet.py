@@ -162,7 +162,7 @@ class ResNet(nn.Module):
 
         return x
 
-def resnet18_3d(**kwargs):
+def resnet18(**kwargs):
     """Constructs a ResNet-18 based model.
     """
     model = ResNet(BasicBlock, [2, 2, 2, 2], **kwargs)
@@ -170,7 +170,7 @@ def resnet18_3d(**kwargs):
     layer_name = list(checkpoint.keys())
     for ln in layer_name :
         if 'conv' in ln or 'downsample.0.weight' in ln:
-            checkpoint[ln] = checkpoint[ln]#.unsqueeze(2)  
+            checkpoint[ln] = checkpoint[ln].unsqueeze(2)  
     model.load_state_dict(checkpoint, strict=False)
     return model
 
@@ -183,11 +183,11 @@ def resnet34_3d(**kwargs):
     layer_name = list(checkpoint.keys())
     for ln in layer_name :
         if 'conv' in ln or 'downsample.0.weight' in ln:
-            checkpoint[ln] = checkpoint[ln]#.unsqueeze(2)  
+            checkpoint[ln] = checkpoint[ln].unsqueeze(2)  
     model.load_state_dict(checkpoint, strict=False)
     return model
 
-def resnet18(**kwargs):
+def resnet18_2d(**kwargs):
     """Constructs a ResNet-18 based model.
     """
     model = ResNetLib(BasicBlockLib, [2, 2, 2, 2], **kwargs)

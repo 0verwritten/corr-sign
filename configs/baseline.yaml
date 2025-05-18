@@ -1,5 +1,5 @@
 feeder: dataset.dataloader_video.BaseFeeder
-phase: test
+phase: train
 dataset: how2sign
 # phase: dev
 # dataset: phoenix2014

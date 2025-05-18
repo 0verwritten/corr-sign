@@ -64,6 +64,7 @@ def seq_train(
             raise
 
     recorder.log(f'\tEpoch {epoch_idx}: Loss: {np.mean(losses):.6f}, LR: {learning_rates[0]:.6f}')
+    print(f'Epoch {epoch_idx}: Loss: {np.mean(losses):.6f}, LR: {learning_rates[0]:.6f}')
     optimizer.scheduler.step()
     return
 
@@ -84,6 +85,7 @@ def seq_eval(
 
     for batch_idx, data in enumerate(tqdm(loader, desc=f"Validating Epoch {epoch}")):
         file_info = data[4]
+        torch.cuda.empty_cache()
         vid, vid_len, label, label_len = [device.data_to_device(x) for x in data[:4]]
         with torch.no_grad():
             ret = model(vid, vid_len, label=label, label_lgt=label_len)
@@ -120,6 +122,7 @@ def seq_eval(
         score = 100.0
 
     recorder.log(f"Epoch {epoch}, {mode} WER: {score:.2f}%", os.path.join(work_dir, f"{mode}.txt"))
+    print(f"Epoch {epoch}, {mode} WER: {score:.2f}%", os.path.join(work_dir, f"{mode}.txt"))
     return score
 
 def seq_feature_generation(loader, model, device, mode, work_dir, recorder):

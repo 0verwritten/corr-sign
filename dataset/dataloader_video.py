@@ -79,7 +79,7 @@ class BaseFeeder(data.Dataset):
             if phase in self.dict.keys():
                 label_list.append(self.dict[phase][0])
         
-        if len(img_list) == 0: raise f"NO IMAGE UNDER {img_folder} path"
+        if len(img_list) == 0: raise Exception(f"NO IMAGE UNDER {img_folder} path")
 
         return [cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB) for img_path in img_list], label_list
 
@@ -99,6 +99,19 @@ class BaseFeeder(data.Dataset):
         #     padding = (0, 0, 0, 0, 0, 0, 0, pad_size)  # Pad at end of time dimension
         #     video = F.pad(video, padding, mode='constant', value=0)
         # print(video.shape)
+        print("original shape", video.shape)
+        if T > 4300:
+            x5d = video.permute(1, 0, 2, 3).unsqueeze(0)
+
+            # Interpolate only along the “depth” axis (T)
+            scale = 300 / video.shape[0]
+            x5d_up = F.interpolate(x5d,
+                                scale_factor=(scale, 1, 1),   # (T, H, W) factors
+                                mode="trilinear",
+                                align_corners=False)
+
+            # (1, C, T’, H, W) → (T’, C, H, W)
+            video = x5d_up.squeeze(0).permute(1, 0, 2, 3)
 
         return video, label
 
@@ -109,8 +122,8 @@ class BaseFeeder(data.Dataset):
                 video_augmentation.RandomCrop(self.input_size),
                 video_augmentation.Resize(self.image_scale),
                 video_augmentation.ToTensor(),
-                video_augmentation.TemporalRescale(0.2, self.frame_interval),
                 video_augmentation.NormalizeVideo(),
+                video_augmentation.TemporalRescale(0.2, self.frame_interval),
             ])
         else:
             print("Apply testing transform.")
