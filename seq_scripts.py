@@ -10,10 +10,10 @@ import torch.nn as nn
 from tqdm import tqdm
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
-from evaluation.slr_eval.wer_calculation import evaluate
 from slr_network import SLRModel, ModelOutput
 import time
 import traceback
+from torchmetrics.text import BLEUScore, BERTScore
 
 from torch.amp import autocast, GradScaler
 
@@ -42,6 +42,7 @@ def seq_train(
         try:
             torch.cuda.empty_cache()
             vid, vid_len, label, label_len = [device.data_to_device(x) for x in data[:4]]
+            print(label)
 
             optimizer.zero_grad()
             with autocast(device.output_device):
@@ -68,6 +69,15 @@ def seq_train(
     optimizer.scheduler.step()
     return
 
+
+def indices_to_tokens(idx_tensor, idx2tok):
+    """
+    idx_tensor : 1-D or 2-D LongTensor on GPU/CPU
+    idx2tok    : dict[int -> str]   (e.g. {0:'<BLK>', 1:'HELLO', 2:'WORLD', …})
+    returns    : list[str]          (tokens without blanks/pads)
+    """
+    return [idx2tok[i] for i in idx_tensor if i in idx2tok and idx2tok[i] != "<UNK>"]
+
 def seq_eval(
     cfg: ConfigArgs,
     loader: torch.utils.data.DataLoader,
@@ -81,49 +91,57 @@ def seq_eval(
 ):
     model.eval()
     num_batches = len(loader)
-    total_info, total_sents, total_conv_sents = [None] * num_batches, [None] * num_batches, [None] * num_batches
+    # ── metric objects (streaming) ────────────────────────────────────────
+    bleu1 = BLEUScore(n_gram=1)
+    bleu2 = BLEUScore(n_gram=2)
+    bleu3 = BLEUScore(n_gram=3)
+    bleu4 = BLEUScore(n_gram=4)
+    bert = BERTScore(lang="en")
 
-    for batch_idx, data in enumerate(tqdm(loader, desc=f"Validating Epoch {epoch}")):
-        file_info = data[4]
-        torch.cuda.empty_cache()
+    # ── id-to-token map ───────────────────────────────────────────────────
+    gloss_file = f"./preprocess/{cfg.dataset}/gloss_dict.npy"
+    id2token = (
+        {v[0]: k for k, v in np.load(gloss_file, allow_pickle=True).item().items()}
+        if os.path.exists(gloss_file) else {}
+    )
+
+    # ── validation loop ───────────────────────────────────────────────────
+    for _, data in enumerate(tqdm(loader, desc=f"Validating Epoch {epoch}")):
+        torch.cuda.empty_cache()                  # frees *unused* GPU blocks
+
         vid, vid_len, label, label_len = [device.data_to_device(x) for x in data[:4]]
-        with torch.no_grad():
-            ret = model(vid, vid_len, label=label, label_lgt=label_len)
 
-        total_info[batch_idx] = [f.split("|")[0] for f in file_info]
-        total_sents[batch_idx] = ret['recognized_sents']
-        total_conv_sents[batch_idx] = ret['conv_sents']
+        with torch.no_grad(), autocast(device.output_device):   # mixed precision ⇒ <½ VRAM
+            ret   = model(vid, vid_len, label=label, label_lgt=label_len)
+            preds = ret["recognized_sents"]                # list[list[(tok, score)]]
 
-    if evaluate_tool != "python":
-        raise NotImplementedError("Only Python evaluation is supported.")
+        # ---> Immediately move small things to CPU & free the big ones <---
+        label = label.cpu()
+        preds_cpu = [p for batch in preds for p, _ in batch]
+        del vid, ret, preds
+        torch.cuda.empty_cache()
 
-    try:
-        write2file(os.path.join(work_dir, f"output-hypothesis-{mode}.ctm"), total_info, total_sents)
-        write2file(os.path.join(work_dir, f"output-hypothesis-{mode}-conv.ctm"), total_info, total_conv_sents)
+        # convert references once, then drop label tensor
+        refs_cpu = indices_to_tokens(label.tolist(), id2token)
+        del label
 
-        score, metrics = evaluate(
-            prefix=work_dir,
-            mode=mode,
-            output_file=f"output-hypothesis-{mode}.ctm",
-            evaluate_dir=cfg.dataset_info['evaluation_dir'],
-            evaluate_prefix=cfg.dataset_info['evaluation_prefix'],
-            output_dir=f"epoch_{epoch}_result/",
-            python_evaluate=True,
-            triplet=True,
-        )
+        # ── update streaming metrics ─────────────────────────────────────
+        bleu1.update(preds_cpu, refs_cpu)
+        bleu2.update(preds_cpu, refs_cpu)
+        bleu3.update(preds_cpu, refs_cpu)
+        bleu4.update(preds_cpu, refs_cpu)
+        bert.update(preds_cpu, refs_cpu)     # <── just one line
+    # ── final numbers ─────────────────────────────────────────────────────
+    bleu_1, bleu_2, bleu_3, bleu_4 = [m.compute().item() for m in (bleu1, bleu2, bleu3, bleu4)]
+    bert_P, bert_R, bert_F          = [x.item() for x in bert.compute()]
 
-        metrics_path = os.path.join(work_dir, f"output-hypothesis-{mode}-epoch-{epoch}-metrics.json")
-        with open(metrics_path, "w") as f:
-            json.dump(metrics, f)
 
-    except Exception:
-        print("Evaluation failed.")
-        print(traceback.format_exc())
-        score = 100.0
+    print(f"BLEU-1 {bleu_1:.2f}  BLEU-2 {bleu_2:.2f}  BLEU-3 {bleu_3:.2f}  BLEU-4 {bleu_4:.2f}")
+    print(f"BERTScore P/R/F : {bert_P:.4f} / {bert_R:.4f} / {bert_F:.4f}")
 
-    recorder.log(f"Epoch {epoch}, {mode} WER: {score:.2f}%", os.path.join(work_dir, f"{mode}.txt"))
-    print(f"Epoch {epoch}, {mode} WER: {score:.2f}%", os.path.join(work_dir, f"{mode}.txt"))
-    return score
+    # recorder.log(f"Epoch {epoch}, {mode} WER: {score:.2f}%", os.path.join(work_dir, f"{mode}.txt"))
+    # print(f"Epoch {epoch}, {mode} WER: {score:.2f}%", os.path.join(work_dir, f"{mode}.txt"))
+    return bert_P
 
 def seq_feature_generation(loader, model, device, mode, work_dir, recorder):
     model.eval()
@@ -165,7 +183,6 @@ def seq_feature_generation(loader, model, device, mode, work_dir, recorder):
         assert start == len(labels)
 
     os.symlink(src_path, tgt_path)
-
 
 def write2file(path, info, output):
     with open(path, "w") as file:

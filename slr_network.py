@@ -10,6 +10,7 @@ from modules.criterions import SeqKD
 from modules import BiLSTMLayer, TemporalConv
 from modules.mobilevit.mobilevit_v2 import MobileViTv2
 import modules.resnet as resnet
+from transformers import T5ForConditionalGeneration, T5TokenizerFast
 
 
 @dataclass
@@ -48,6 +49,8 @@ class SLRModel(nn.Module):
         loss_weights=None,
         weight_norm=True,
         share_classifier=True,
+        t5_name="t5-base",              # 768-dim hidden
+        freeze_t5=True,                 # start frozen – unfreeze gradually
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -57,33 +60,35 @@ class SLRModel(nn.Module):
 
         # CNN frontend (2D ResNet)
         self.conv2d = getattr(resnet, c2d_type)()
+        # self.conv2d.requires_grad_(False)
         self.conv2d.fc = Identity()
 
         # 1D convolution temporal extractor
         self.conv1d = TemporalConv(
-            input_size=512,
+            input_size=512 if c2d_type in ['resnet18', 'resnet34'] else 2048,
             hidden_size=hidden_size,
             conv_type=conv_type,
             use_bn=use_bn,
             num_classes=num_classes,
         )
 
-        # Sequence model (BiLSTM)
-        self.temporal_model = BiLSTMLayer(
-            # rnn_type="LSTM",
-            input_size=hidden_size,
-            hidden_size=hidden_size,
-            num_layers=2,
-            bidirectional=True,
-        )
-        # self.temporal_model = Conformer(
-        #     input_dim=hidden_size,
-        #     num_heads=4,
-        #     ffn_dim=hidden_size*4,
-        #     num_layers=12,
-        #     depthwise_conv_kernel_size=31,
+        # # Sequence model (BiLSTM)
+        # self.temporal_model = BiLSTMLayer(
+        #     # rnn_type="LSTM",
+        #     input_size=hidden_size,
+        #     hidden_size=hidden_size,
+        #     num_layers=2,
+        #     bidirectional=True,
+        #     dropout=0,
         # )
 
+        self.proj = nn.Linear(hidden_size, 768)        # T5-base hidden size
+        self.t5   = T5ForConditionalGeneration.from_pretrained(t5_name)
+        if freeze_t5:
+            self.t5.requires_grad_(False)              # later unfreeze last k blocks
+
+        # tokenizer is kept outside of the module so DDP can share one copy
+        self.tokenizer = T5TokenizerFast.from_pretrained(t5_name)
 
         # Classifier
         cls_layer = NormLinear if weight_norm else nn.Linear
@@ -95,6 +100,7 @@ class SLRModel(nn.Module):
 
         # Decoder
         self.decoder = utils.Decode(gloss_dict, num_classes, search_mode="beam")
+        print(num_classes)
 
         # Losses
         self.loss = {
@@ -102,8 +108,8 @@ class SLRModel(nn.Module):
             "distillation": SeqKD(T=8),
         }
 
-    def forward(self, x, len_x, label=None, label_lgt=None) -> ModelOutput:
-        print("input", x.shape)
+    def forward(self, x, len_x, text=None) -> ModelOutput:
+        # print("input", x.shape)
         if len(x.shape) == 5:
             # videos
             batch, temp, channel, height, width = x.shape
@@ -119,78 +125,55 @@ class SLRModel(nn.Module):
         # x: T, B, C
         x = conv1d_outputs['visual_feat']
         lgt = conv1d_outputs['feat_len']
-        tm_outputs = self.temporal_model(x, lgt)
-        outputs = self.classifier(tm_outputs['predictions'])
-        pred = None if self.training \
-            else self.decoder.decode(outputs, lgt, batch_first=False, probs=False)
-        conv_pred = None if self.training \
-            else self.decoder.decode(conv1d_outputs['conv_logits'], lgt, batch_first=False, probs=False)
+        # tm_outputs = self.temporal_model(x, lgt)
+        # outputs = self.classifier(tm_outputs['predictions'])
+        # pred = None if self.training \
+        #     else self.decoder.decode(outputs, lgt, batch_first=False, probs=False)
+        # conv_pred = None if self.training \
+        #     else self.decoder.decode(conv1d_outputs['conv_logits'], lgt, batch_first=False, probs=False)
 
-        return {
-            #"framewise_features": framewise,
-            #"visual_features": x,
-            "feat_len": lgt,
-            "conv_logits": conv1d_outputs['conv_logits'],
-            "sequence_logits": outputs,
-            "conv_sents": conv_pred,
-            "recognized_sents": pred,
-        }
-    
-        # # ── 1) Extract per-frame features via sliding‐window through 2D ResNet ──
-        # # old framewise = self.conv2d(x.permute(0,2,1,3,4)).view(batch, temp, -1).permute(0,2,1) # btc -> bct
-        # if x.ndim == 5:
-        #     # x: (B, T, C, H, W)
-        #     B, T, C, H, W = x.shape
-        #     ws, st = self.window_size, self.stride
+        feats_proj = self.proj(x)                    # (B,T',768)
+        attn_mask  = torch.ones(feats_proj.size()[:-1], dtype=torch.long,
+                                device=feats_proj.device)    # (B,T')
 
-        #     feats = []
-        #     for start in range(0, T, st):
-        #         end = min(start + ws, T)
-        #         win = x[:, start:end]               # (B, win_len, C, H, W)
-        #         win_len = end - start
+        if text is not None:                              # training
+            tok = self.tokenizer(text, padding="longest", return_tensors="pt"
+                                  ).to(feats_proj.device)
+            print(feats_proj.shape,
+attn_mask.shape,
+tok.input_ids,
+tok.input_ids)
+            out = self.t5(inputs_embeds=feats_proj,
+                          attention_mask=attn_mask,
+                          decoder_input_ids=tok.input_ids,
+                          labels=tok.input_ids)
+            loss   = out.loss
+            preds  = out.logits.argmax(-1)
+        else:                                                # inference
+            preds = self.t5.generate(inputs_embeds=feats_proj,
+                                      attention_mask=attn_mask,
+                                      num_beams=4,
+                                      max_length=64)
+            loss = None
+        
+        pred_text = self.tokenizer.batch_decode(
+                preds, skip_special_tokens=True, clean_up_tokenization_spaces=True
+            )
 
-        #         # flatten temporal into batch
-        #         win = win.contiguous().view(-1, C, H, W)   # (B * win_len, C, H, W)
-        #         f = self.conv2d(win)                       # (B * win_len, feat_dim)
-        #         f = f.view(B, win_len, -1).permute(0, 2, 1) # (B, feat_dim, win_len)
-
-        #         feats.append(f)
-        #         # free temporary
-        #         del win, f
-
-        #     # stitch windows back along time
-        #     framewise = torch.cat(feats, dim=2)             # (B, feat_dim, total_frames)
-        #     seq_lengths = torch.tensor([framewise.shape[-1]])
-        # else:
-        #     # already per-frame features: expect (B, feat_dim, T)
-        #     framewise    = x
-        #     seq_lengths  = len_x
-
-        # # ── 2) Temporal conv → BiLSTM → classifier → decoding ──
-        # # print(framewise.shape, seq_lengths)
-        # conv1d_out   = self.conv1d(framewise, seq_lengths)
-        # x_feat       = conv1d_out['visual_feat']           # (B, hidden, T′)
-        # lgt          = conv1d_out['feat_len']
-        # # print(x_feat.shape, lgt, seq_lengths)
-        # tm_out       = self.temporal_model(x_feat, lgt)
-        # logits       = self.classifier(tm_out['predictions'])  # (T′, B, num_classes)
-
-        # if not self.training:
-        #     pred      = self.decoder.decode(logits,    lgt, batch_first=False)
-        #     conv_pred = self.decoder.decode(
-        #                     conv1d_out['conv_logits'], lgt, batch_first=False
-        #                 )
-        # else:
-        #     pred = conv_pred = None
+        return {"loss": loss, "pred_ids": preds, 'pred_text': pred_text,
+                # keep these if you still want the old auxiliary heads
+                "conv_logits": conv1d_outputs['conv_logits'],
+                "feat_len": lgt}
 
         # return {
-        #     "feat_len":        lgt,
-        #     "conv_logits":     conv1d_out['conv_logits'],
-        #     "sequence_logits": logits,
-        #     "conv_sents":      conv_pred,
+        #     #"framewise_features": framewise,
+        #     #"visual_features": x,
+        #     "feat_len": lgt,
+        #     "conv_logits": conv1d_outputs['conv_logits'],
+        #     "sequence_logits": outputs,
+        #     "conv_sents": conv_pred,
         #     "recognized_sents": pred,
         # }
-
 
     def criterion_calculation(self, output: ModelOutput, label, label_lgt):
         label      = label.to(dtype=torch.long)
@@ -205,16 +188,16 @@ class SLRModel(nn.Module):
         for name, weight in self.loss_weights.items():
             if name == "ConvCTC":
                 log_probs = output["conv_logits"].log_softmax(-1)
-                print("ConvCTC loss", log_probs.shape, label.shape, feat_len.shape, label_lgt.shape)
+                # print("ConvCTC loss", log_probs.shape, label.shape, feat_len.shape, label_lgt.shape)
                 loss = self.loss["CTCLoss"](log_probs, label, feat_len, label_lgt).mean()
 
             elif name == "SeqCTC":
                 log_probs = output["sequence_logits"].log_softmax(-1)
-                print("SeqCTC loss", log_probs.shape, label.shape, feat_len.shape, label_lgt.shape)
+                # print("SeqCTC loss", log_probs.shape, label.shape, feat_len.shape, label_lgt.shape)
                 loss = self.loss["CTCLoss"](log_probs, label, feat_len, label_lgt).mean()
 
             elif name == "Dist":
-                print("Dist loss", output["conv_logits"].shape, output["sequence_logits"].shape)
+                # print("Dist loss", output["conv_logits"].shape, output["sequence_logits"].shape)
                 loss = self.loss["distillation"](
                     output["conv_logits"],
                     output["sequence_logits"].detach(),
