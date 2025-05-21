@@ -13,7 +13,9 @@ import matplotlib.pyplot as plt
 from slr_network import SLRModel, ModelOutput
 import time
 import traceback
-from torchmetrics.text import BLEUScore, BERTScore
+from torchmetrics.text import BLEUScore
+from bert_score import BERTScorer
+from torchmetrics.text import WordErrorRate
 
 from torch.amp import autocast, GradScaler
 
@@ -34,40 +36,47 @@ def seq_train(
     recorder: utils.Recorder,
 ):
     model.train()
-    losses = []
     scaler = GradScaler(device.output_device)
-    learning_rates = [group['lr'] for group in optimizer.optimizer.param_groups]
+    running_loss = 0.0
+    num_samples = 0
+    lr0 = optimizer.optimizer.param_groups[0]["lr"]
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
 
-    for batch_idx, data in enumerate(tqdm(loader, desc=f"Training Epoch {epoch_idx}")):
-        try:
-            torch.cuda.empty_cache()
-            vid, vid_len, label, label_len = [device.data_to_device(x) for x in data[:4]]
-            print(label)
+    pbar = tqdm(loader, position=1, leave=False, desc=f"Epoch {epoch_idx}")
+    for batch_idx, data in enumerate(
+        pbar
+    ):
 
-            optimizer.zero_grad()
-            with autocast(device.output_device):
-                ret = model(vid, vid_len, label=label, label_lgt=label_len)
-                loss = model.criterion_calculation(ret, label, label_len)
+        vid, vid_len = [device.data_to_device(x) for x in data[:2]]
+        txt = data[4]
 
-            if not torch.isfinite(loss):
-                print(f"Skipping batch {batch_idx} due to invalid loss.")
-                continue
+        optimizer.zero_grad()
+        with autocast(device.output_device):
+            ret = model(vid, vid_len, txt)
+            (loss_t5, contr_loss) = ret["loss"]
+            loss = loss_t5 + contr_loss * 0.5
+            recorder.log(f"\t\t {ret['pred_text']} --||-- {txt}")
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer.optimizer)
-            scaler.update()
+        if not torch.isfinite(loss):
+            continue
 
-            losses.append(loss.item())
+        scaler.scale(loss).backward()
+        scaler.step(optimizer.optimizer)
+        scaler.update()
+        pbar.set_description(f"Epoch {epoch_idx}; Loss: {loss} {loss_t5} {contr_loss}")
 
-        except Exception as e:
-            print(f"Exception at batch {batch_idx}: {e}")
-            print(traceback.format_exc())
-            raise
+        bs = vid.size(0)
+        running_loss += loss.item() * bs
+        num_samples += bs
 
-    recorder.log(f'\tEpoch {epoch_idx}: Loss: {np.mean(losses):.6f}, LR: {learning_rates[0]:.6f}')
-    print(f'Epoch {epoch_idx}: Loss: {np.mean(losses):.6f}, LR: {learning_rates[0]:.6f}')
-    optimizer.scheduler.step()
-    return
+        del vid, vid_len, ret, loss
+        torch.cuda.empty_cache()
+
+    mean_loss = running_loss / max(1, num_samples)
+    recorder.log(f"Epoch {epoch_idx}: Loss {mean_loss:.6f}, LR {lr0:.6f}")
+    # print(f"Epoch {epoch_idx}: Loss {mean_loss:.6f}, LR {lr0:.6f}")
+    return mean_loss
 
 
 def indices_to_tokens(idx_tensor, idx2tok):
@@ -77,6 +86,7 @@ def indices_to_tokens(idx_tensor, idx2tok):
     returns    : list[str]          (tokens without blanks/pads)
     """
     return [idx2tok[i] for i in idx_tensor if i in idx2tok and idx2tok[i] != "<UNK>"]
+
 
 def seq_eval(
     cfg: ConfigArgs,
@@ -90,58 +100,46 @@ def seq_eval(
     evaluate_tool="python",
 ):
     model.eval()
-    num_batches = len(loader)
-    # ── metric objects (streaming) ────────────────────────────────────────
     bleu1 = BLEUScore(n_gram=1)
     bleu2 = BLEUScore(n_gram=2)
     bleu3 = BLEUScore(n_gram=3)
     bleu4 = BLEUScore(n_gram=4)
-    bert = BERTScore(lang="en")
+    wer = WordErrorRate()
 
-    # ── id-to-token map ───────────────────────────────────────────────────
-    gloss_file = f"./preprocess/{cfg.dataset}/gloss_dict.npy"
-    id2token = (
-        {v[0]: k for k, v in np.load(gloss_file, allow_pickle=True).item().items()}
-        if os.path.exists(gloss_file) else {}
-    )
+    gloss_path = f"./preprocess/{cfg.dataset}/gloss_dict.npy"
+    id2tok = {}
+    if os.path.exists(gloss_path):
+        id2tok = {
+            v[0]: k for k, v in np.load(gloss_path, allow_pickle=True).item().items()
+        }
 
-    # ── validation loop ───────────────────────────────────────────────────
-    for _, data in enumerate(tqdm(loader, desc=f"Validating Epoch {epoch}")):
-        torch.cuda.empty_cache()                  # frees *unused* GPU blocks
+    for data in tqdm(loader, desc=f"Valid Epoch {epoch}", leave=False):
 
-        vid, vid_len, label, label_len = [device.data_to_device(x) for x in data[:4]]
+        vid, vid_len = [device.data_to_device(x) for x in data[:2]]
+        txt = data[4]
 
-        with torch.no_grad(), autocast(device.output_device):   # mixed precision ⇒ <½ VRAM
-            ret   = model(vid, vid_len, label=label, label_lgt=label_len)
-            preds = ret["recognized_sents"]                # list[list[(tok, score)]]
+        with torch.no_grad(), autocast(device.output_device):
+            ret = model(vid, vid_len, text=txt)
+            pred_sent = ret["pred_text"]
+            ref_sent = txt
 
-        # ---> Immediately move small things to CPU & free the big ones <---
-        label = label.cpu()
-        preds_cpu = [p for batch in preds for p, _ in batch]
-        del vid, ret, preds
+        bleu1.update(pred_sent, ref_sent)
+        bleu2.update(pred_sent, ref_sent)
+        bleu3.update(pred_sent, ref_sent)
+        bleu4.update(pred_sent, ref_sent)
+        # wer_score = wer(preds=[pred_sent], target=[ref_sent])
+        recorder.log(f"predicted: {pred_sent}")
+        recorder.log(f"ground truth: {ref_sent}")
+
+        del vid, vid_len, ret
         torch.cuda.empty_cache()
 
-        # convert references once, then drop label tensor
-        refs_cpu = indices_to_tokens(label.tolist(), id2token)
-        del label
+    b1, b2, b3, b4 = (m.compute().item() for m in (bleu1, bleu2, bleu3, bleu4))
+    recorder.log(f"BLEU-1 {b1:.2f} BLEU-2 {b2:.2f} BLEU-3 {b3:.2f} BLEU-4 {b4:.2f}")
+    # print(       f"BLEU-1 {b1:.2f} BLEU-2 {b2:.2f} BLEU-3 {b3:.2f} BLEU-4 {b4:.2f}")
 
-        # ── update streaming metrics ─────────────────────────────────────
-        bleu1.update(preds_cpu, refs_cpu)
-        bleu2.update(preds_cpu, refs_cpu)
-        bleu3.update(preds_cpu, refs_cpu)
-        bleu4.update(preds_cpu, refs_cpu)
-        bert.update(preds_cpu, refs_cpu)     # <── just one line
-    # ── final numbers ─────────────────────────────────────────────────────
-    bleu_1, bleu_2, bleu_3, bleu_4 = [m.compute().item() for m in (bleu1, bleu2, bleu3, bleu4)]
-    bert_P, bert_R, bert_F          = [x.item() for x in bert.compute()]
+    return b4
 
-
-    print(f"BLEU-1 {bleu_1:.2f}  BLEU-2 {bleu_2:.2f}  BLEU-3 {bleu_3:.2f}  BLEU-4 {bleu_4:.2f}")
-    print(f"BERTScore P/R/F : {bert_P:.4f} / {bert_R:.4f} / {bert_F:.4f}")
-
-    # recorder.log(f"Epoch {epoch}, {mode} WER: {score:.2f}%", os.path.join(work_dir, f"{mode}.txt"))
-    # print(f"Epoch {epoch}, {mode} WER: {score:.2f}%", os.path.join(work_dir, f"{mode}.txt"))
-    return bert_P
 
 def seq_feature_generation(loader, model, device, mode, work_dir, recorder):
     model.eval()
@@ -151,7 +149,9 @@ def seq_feature_generation(loader, model, device, mode, work_dir, recorder):
     os.makedirs("./features/", exist_ok=True)
 
     if os.path.islink(tgt_path):
-        if work_dir[1:] in os.readlink(tgt_path) and os.path.isabs(os.readlink(tgt_path)):
+        if work_dir[1:] in os.readlink(tgt_path) and os.path.isabs(
+            os.readlink(tgt_path)
+        ):
             return
         os.unlink(tgt_path)
 
@@ -161,7 +161,7 @@ def seq_feature_generation(loader, model, device, mode, work_dir, recorder):
 
     os.makedirs(src_path, exist_ok=True)
 
-    for batch_idx, data in tqdm(enumerate(loader), total=len(loader)):
+    for batch_idx, data in tqdm(enumerate(loader), total=len(loader), leave=False):
         vid, vid_len = device.data_to_device(data[0]), device.data_to_device(data[1])
         labels, label_lens, file_infos = data[2], data[3], data[4]
 
@@ -171,22 +171,30 @@ def seq_feature_generation(loader, model, device, mode, work_dir, recorder):
         start = 0
         for idx, file_name in enumerate(file_infos):
             end = start + label_lens[idx]
-            file_base = file_name.split('|')[0]
+            file_base = file_name.split("|")[0]
             save_path = os.path.join(src_path, f"{file_base}_features.npy")
 
-            np.save(save_path, {
-                "label": labels[start:end],
-                "features": ret['framewise_features'][idx][:, :vid_len[idx]].T.cpu().numpy(),
-            })
+            np.save(
+                save_path,
+                {
+                    "label": labels[start:end],
+                    "features": ret["framewise_features"][idx][:, : vid_len[idx]]
+                    .T.cpu()
+                    .numpy(),
+                },
+            )
 
             start = end
         assert start == len(labels)
 
     os.symlink(src_path, tgt_path)
 
+
 def write2file(path, info, output):
     with open(path, "w") as file:
         for sample_idx, words in enumerate(output):
             for word_idx, word in enumerate(words):
                 label = "[EMPTY]" if not word else word[0]
-                file.write(f"{info[sample_idx]} 1 {word_idx * 0.01:.2f} {(word_idx + 1) * 0.01:.2f} {label}\n")
+                file.write(
+                    f"{info[sample_idx]} 1 {word_idx * 0.01:.2f} {(word_idx + 1) * 0.01:.2f} {label}\n"
+                )

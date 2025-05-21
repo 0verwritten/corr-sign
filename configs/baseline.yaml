@@ -4,7 +4,7 @@ dataset: how2sign
 # phase: dev
 # dataset: phoenix2014
 # dataset: phoenix14-si5  #CSL-Daily, phoenix2014-T, phoenix2014, CSL
-num_epoch: 30
+num_epoch: 100
 # load_checkpoints: tmpdev_100.00_epoch0_model.pt
 # load_checkpoints: "/home/maveric/Downloads/dev_18.90_PHOENIX14.pt"
 work_dir: ./tmp
@@ -25,13 +25,13 @@ loss_weights:
   SeqCTC: 1.0
   # VAC
   ConvCTC: 1.0
-  Dist: 25.0
+  Dist: 1.0
 #load_weights: ''
 
 optimizer_args:
   optimizer: Adam
   base_lr: 0.0001
-  step: [ 20, 35]
+  step: [ 25, 45]
   learning_ratio: 1
   weight_decay: 0.0001
   start_epoch: 0
@@ -47,14 +47,16 @@ feeder_args:
   input_size: 224
 
 model: slr_network.SLRModel
-# decode_mode: beam 
-decode_mode: max
+decode_mode: beam 
+# decode_mode: max
 model_args:
   # num_classes: 1296 # phoenix
-  num_classes: 1101
-  c2d_type: resnet18 #resnet18, mobilenet_v2, squeezenet1_1, shufflenet_v2_x1_0, efficientnet_b1, mnasnet1_0, regnet_y_800mf, vgg16_bn, vgg11_bn, regnet_x_800mf, regnet_x_400mf, densenet121, regnet_y_1_6gf
+  # num_classes: 1101 #how2sign
+  num_classes: 65 # test
+  c2d_type: resnet18
+  # resnet18, resnet34, resnet50, resnet101, resnet152
   conv_type: 2
   use_bn: 1
   # SMKD
-  share_classifier: True
+  share_classifier: False
   weight_norm: True

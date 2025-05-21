@@ -48,19 +48,27 @@ class BaseFeeder(data.Dataset):
         print("")
 
     def __getitem__(self, idx):
+        if not hasattr(self, '_cache'):
+            self._cache = {}
+
+        if idx in self._cache:
+            return self._cache[idx]
+
         if self.data_type == "video":
-            input_data, label = self.read_video(idx)
+            input_data, label, text = self.read_video(idx)
             input_data, label = self.normalize(input_data, label)
-            # input_data, label = self.normalize(input_data, label, fi['fileid'])
-            return input_data, torch.LongTensor(label), self.inputs_list[idx]['original_info']
+            result = (input_data, torch.LongTensor(label), text, self.inputs_list[idx]['original_info'])
         elif self.data_type == "lmdb":
             raise NotImplementedError()
             input_data, label, fi = self.read_lmdb(idx)
             input_data, label = self.normalize(input_data, label)
-            return input_data, torch.LongTensor(label), self.inputs_list[idx]['original_info']
+            result = (input_data, torch.LongTensor(label), self.inputs_list[idx]['original_info'])
         else:
             input_data, label = self.read_features(idx)
-            return input_data, label, self.inputs_list[idx]['original_info']
+            result = (input_data, label, self.inputs_list[idx]['original_info'])
+
+        self._cache[idx] = result
+        return result
 
     def read_video(self, index):
         # load file info
@@ -81,7 +89,7 @@ class BaseFeeder(data.Dataset):
         
         if len(img_list) == 0: raise Exception(f"NO IMAGE UNDER {img_folder} path")
 
-        return [cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB) for img_path in img_list], label_list
+        return [cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB) for img_path in img_list], label_list, None if 'label' not in file_info else file_info['label']
 
     def read_features(self, index):
         # load file info
@@ -99,12 +107,12 @@ class BaseFeeder(data.Dataset):
         #     padding = (0, 0, 0, 0, 0, 0, 0, pad_size)  # Pad at end of time dimension
         #     video = F.pad(video, padding, mode='constant', value=0)
         # print(video.shape)
-        print("original shape", video.shape)
-        if T > 4300:
+        # print("original shape", video.shape)
+        if T > 200 or True:
             x5d = video.permute(1, 0, 2, 3).unsqueeze(0)
 
             # Interpolate only along the “depth” axis (T)
-            scale = 300 / video.shape[0]
+            scale = 200 / video.shape[0]
             x5d_up = F.interpolate(x5d,
                                 scale_factor=(scale, 1, 1),   # (T, H, W) factors
                                 mode="trilinear",
@@ -119,11 +127,12 @@ class BaseFeeder(data.Dataset):
         if self.transform_mode == "train":
             print("Apply training transform.")
             return transforms.Compose([
-                video_augmentation.RandomCrop(self.input_size),
+                video_augmentation.CenterCrop(self.input_size),
+                # video_augmentation.RandomCrop(self.input_size),
                 video_augmentation.Resize(self.image_scale),
                 video_augmentation.ToTensor(),
                 video_augmentation.NormalizeVideo(),
-                video_augmentation.TemporalRescale(0.2, self.frame_interval),
+                # video_augmentation.TemporalRescale(0.2, self.frame_interval),
             ])
         else:
             print("Apply testing transform.")
@@ -137,7 +146,7 @@ class BaseFeeder(data.Dataset):
     @staticmethod
     def collate_fn(batch):
         batch = [item for item in sorted(batch, key=lambda x: len(x[0]), reverse=True)]
-        video, label, info = list(zip(*batch))
+        video, label, text, info = list(zip(*batch))
         
         left_pad = 0
         last_stride = 1
@@ -183,7 +192,7 @@ class BaseFeeder(data.Dataset):
             for lab in label:
                 padded_label.extend(lab)
             padded_label = torch.LongTensor(padded_label)
-            return padded_video, video_length, padded_label, label_length, info
+            return padded_video, video_length, padded_label, label_length, text, info
 
     def __len__(self):
         return len(self.inputs_list) - 1

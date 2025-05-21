@@ -12,7 +12,6 @@ from modules.mobilevit.mobilevit_v2 import MobileViTv2
 import modules.resnet as resnet
 from transformers import T5ForConditionalGeneration, T5TokenizerFast
 
-
 @dataclass
 class ModelOutput(TypedDict):
     feat_len: List[int]
@@ -35,6 +34,32 @@ class NormLinear(nn.Module):
     def forward(self, x):
         return torch.matmul(x, F.normalize(self.weight, dim=0))
 
+class NTXent(nn.Module):
+    """Cosine-similarity InfoNCE loss (SimCLR)."""
+    def __init__(self, temperature: float = 0.07):
+        super().__init__()
+        self.T = temperature
+
+    def forward(self, z1, z2):
+        z1 = F.normalize(z1, dim=1)
+        z2 = F.normalize(z2, dim=1)
+        # positives: diagonal of cosine-sim matrix
+        pos = (z1 * z2).sum(dim=1) / self.T                # [B]
+
+        # full similarity matrix: [2B, 2B]
+        z = torch.cat([z1, z2], dim=0)                     # [2B, D]
+        sim = (z.float() @ z.float().T) / self.T
+        sim.fill_diagonal_(float('-inf'))                           # mask self-sim
+
+        # InfoNCE
+        log_prob = pos.float() - sim.logsumexp(dim=1)[: z1.size(0)]
+        return -log_prob.mean().to(pos.dtype)
+
+# decoder  = ctc_decoder(lexicon = None,tokens=vocab, blank_token=tokens["id2token"][1], sil_token=tokens["id2token"][1], unk_word=tokens['id2token'][0], beam_size=10, lm=None)  # add lm_path=... for KenLM
+# beam_out = decoder(logits.cpu().float().contiguous(), input_lens.cpu().float().contiguous())
+# best_hyps = [h[0].tokens for h in beam_out]                  # beam_out is a list per sample
+
+
 class SLRModel(nn.Module):
     def __init__(
         self,
@@ -51,6 +76,9 @@ class SLRModel(nn.Module):
         share_classifier=True,
         t5_name="t5-base",              # 768-dim hidden
         freeze_t5=True,                 # start frozen – unfreeze gradually
+        contrast_dim=256,
+        contrast_tau=0.07,
+        contrast_lambda=0.1,        # weight of contrastive branch
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -58,7 +86,7 @@ class SLRModel(nn.Module):
         self.window_size = window_size
         self.stride = stride
 
-        # CNN frontend (2D ResNet)
+        # CNN frontend (3D ResNet)
         self.conv2d = getattr(resnet, c2d_type)()
         # self.conv2d.requires_grad_(False)
         self.conv2d.fc = Identity()
@@ -72,7 +100,23 @@ class SLRModel(nn.Module):
             num_classes=num_classes,
         )
 
-        # # Sequence model (BiLSTM)
+        self.c2d_proj = nn.Sequential(                 # view 1  (after ResNet)
+            nn.AdaptiveAvgPool1d(1),  # T-pool
+            nn.Flatten(),             # [B, C]
+            nn.Linear(512 if c2d_type in ['resnet18', 'resnet34'] else 2048, contrast_dim),
+            nn.SiLU(),
+            nn.Linear(contrast_dim, contrast_dim)
+        )
+        self.c1d_proj = nn.Sequential(                 # view 2 (after TemporalConv)
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(hidden_size, contrast_dim),
+            nn.SiLU(),
+            nn.Linear(contrast_dim, contrast_dim)
+        )
+        self.contrast_loss = NTXent(contrast_tau)
+        self.contrast_lambda = contrast_lambda
+
         # self.temporal_model = BiLSTMLayer(
         #     # rnn_type="LSTM",
         #     input_size=hidden_size,
@@ -83,14 +127,32 @@ class SLRModel(nn.Module):
         # )
 
         self.proj = nn.Linear(hidden_size, 768)        # T5-base hidden size
+        self.act   = nn.SiLU()
+        self.norm  = nn.LayerNorm(768)
         self.t5   = T5ForConditionalGeneration.from_pretrained(t5_name)
-        if freeze_t5:
-            self.t5.requires_grad_(False)              # later unfreeze last k blocks
+        # if freeze_t5:
+        #     self.t5.requires_grad_(False)              # later unfreeze last k blocks
 
         # tokenizer is kept outside of the module so DDP can share one copy
         self.tokenizer = T5TokenizerFast.from_pretrained(t5_name)
 
-        # Classifier
+        self.t5.requires_grad_(False)          # whole model frozen
+
+        n = 0
+        enc_blocks = self.t5.encoder.block
+        n = min(n, len(enc_blocks))
+
+        if n:
+            for blk in enc_blocks[:n]:
+                for p in blk.parameters():
+                    p.requires_grad = True
+
+        trainable = sum(p.numel() for p in self.t5.parameters() if p.requires_grad)
+        total     = sum(p.numel() for p in self.t5.parameters())
+
+        print(f"[T5-unfreeze]  last {n} encoder layers now trainable "
+            f"→ {trainable/1e6:.1f} M / {total/1e6:.1f} M params")
+
         cls_layer = NormLinear if weight_norm else nn.Linear
         self.classifier = cls_layer(hidden_size, num_classes)
         if share_classifier:
@@ -98,15 +160,13 @@ class SLRModel(nn.Module):
         else:
             self.conv1d.fc = cls_layer(hidden_size, num_classes)
 
-        # Decoder
         self.decoder = utils.Decode(gloss_dict, num_classes, search_mode="beam")
         print(num_classes)
 
-        # Losses
-        self.loss = {
-            "CTCLoss": nn.CTCLoss(reduction="none", zero_infinity=False),
-            "distillation": SeqKD(T=8),
-        }
+        # self.loss = {
+        #     "CTCLoss": nn.CTCLoss(reduction="none", zero_infinity=False),
+        #     "distillation": SeqKD(T=8),
+        # }
 
     def forward(self, x, len_x, text=None) -> ModelOutput:
         # print("input", x.shape)
@@ -132,35 +192,38 @@ class SLRModel(nn.Module):
         # conv_pred = None if self.training \
         #     else self.decoder.decode(conv1d_outputs['conv_logits'], lgt, batch_first=False, probs=False)
 
-        feats_proj = self.proj(x)                    # (B,T',768)
-        attn_mask  = torch.ones(feats_proj.size()[:-1], dtype=torch.long,
-                                device=feats_proj.device)    # (B,T')
 
-        if text is not None:                              # training
-            tok = self.tokenizer(text, padding="longest", return_tensors="pt"
-                                  ).to(feats_proj.device)
-            print(feats_proj.shape,
-attn_mask.shape,
-tok.input_ids,
-tok.input_ids)
-            out = self.t5(inputs_embeds=feats_proj,
-                          attention_mask=attn_mask,
-                          decoder_input_ids=tok.input_ids,
-                          labels=tok.input_ids)
+        z1 = self.c2d_proj(framewise)          # framewise: [B, C, T]
+        # View 2: TemporalConv features (x : [T, B, C] -> [B, C, T])
+        z2 = self.c1d_proj(x.permute(1, 2, 0))
+
+        contr_loss = self.contrast_loss(z1, z2) if self.training else 0.0
+
+        feats_proj = self.norm(self.proj(self.act(x))).permute(1, 0, 2) # (B, T, 768)
+
+        if text is not None:                       # training branch
+            tok = self.tokenizer(
+                text, padding="longest", return_tensors="pt"
+            ).to(feats_proj.device)
+
+            out = self.t5(
+                inputs_embeds       = feats_proj,
+                decoder_input_ids   = tok.input_ids,
+                labels              = tok.input_ids,
+            )
             loss   = out.loss
             preds  = out.logits.argmax(-1)
         else:                                                # inference
             preds = self.t5.generate(inputs_embeds=feats_proj,
-                                      attention_mask=attn_mask,
-                                      num_beams=4,
-                                      max_length=64)
+                                    decoder_start_token_id=self.tokenizer.pad_token_id,
+                                      num_beams=4)
             loss = None
         
         pred_text = self.tokenizer.batch_decode(
                 preds, skip_special_tokens=True, clean_up_tokenization_spaces=True
             )
 
-        return {"loss": loss, "pred_ids": preds, 'pred_text': pred_text,
+        return {"loss": (loss, contr_loss), "pred_ids": preds, 'pred_text': pred_text,
                 # keep these if you still want the old auxiliary heads
                 "conv_logits": conv1d_outputs['conv_logits'],
                 "feat_len": lgt}

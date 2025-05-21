@@ -1,4 +1,6 @@
+from typing import Optional, Callable
 import torch
+from torch import Tensor
 import torch.nn as nn
 import torch.utils.model_zoo as model_zoo
 import torch.nn.functional as F
@@ -7,8 +9,7 @@ from torchvision.models import resnet18, ResNet as ResNetLib
 from torchvision.models.resnet import BasicBlock as BasicBlockLib 
 
 __all__ = [
-    'ResNet', 'resnet10', 'resnet18', 'resnet34', 'resnet50', 'resnet101',
-    'resnet152', 'resnet200'
+    'resnet18', 'resnet34', 'resnet50', 'resnet101', 'resnet152'
 ]
 model_urls = {
     'resnet18': 'https://download.pytorch.org/models/resnet18-f37072fd.pth',
@@ -22,34 +23,70 @@ def checkpoint1(func, *args, **kwargs):
     return func(*args)
 
 class Get_Correlation(nn.Module):
-    def __init__(self, channels):
+    """
+    Memory-reduced replacement for Get_Correlation.
+    Input / output tensors untouched: (B,C,T,H,W) → (B,C,T,H,W)
+    """
+    def __init__(self, channels: int):
         super().__init__()
-        reduction_channel = channels//16
-        self.down_conv = nn.Conv3d(channels, reduction_channel, kernel_size=1, bias=False)
+        red_ch = max(channels // 32, 1)
 
-        self.down_conv2 = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
-        self.spatial_aggregation1 = nn.Conv3d(reduction_channel, reduction_channel, kernel_size=(9,3,3), padding=(4,1,1), groups=reduction_channel)
-        self.spatial_aggregation2 = nn.Conv3d(reduction_channel, reduction_channel, kernel_size=(9,3,3), padding=(4,2,2), dilation=(1,2,2), groups=reduction_channel)
-        self.spatial_aggregation3 = nn.Conv3d(reduction_channel, reduction_channel, kernel_size=(9,3,3), padding=(4,3,3), dilation=(1,3,3), groups=reduction_channel)
-        self.weights = nn.Parameter(torch.ones(3) / 3, requires_grad=True)
-        self.weights2 = nn.Parameter(torch.ones(2) / 2, requires_grad=True)
-        self.conv_back = nn.Conv3d(reduction_channel, channels, kernel_size=1, bias=False)
+        # 1×1 reductions
+        self.down_q  = nn.Conv3d(channels, red_ch, kernel_size=1, bias=False)
+        self.down_kv = nn.Conv3d(channels, channels,  kernel_size=1, bias=False)
 
-    def forward(self, x):
+        # depth-wise spatial context (same as before)
+        self.spa1 = nn.Conv3d(red_ch, red_ch, kernel_size=(9,3,3),
+                              padding=(4,1,1), groups=red_ch, bias=False)
+        self.spa2 = nn.Conv3d(red_ch, red_ch, kernel_size=(9,3,3),
+                              padding=(4,2,2), dilation=(1,2,2),
+                              groups=red_ch, bias=False)
+        self.spa3 = nn.Conv3d(red_ch, red_ch, kernel_size=(9,3,3),
+                              padding=(4,3,3), dilation=(1,3,3),
+                              groups=red_ch, bias=False)
 
-        x2 = self.down_conv2(x)
-        affinities = torch.einsum('bcthw,bctsd->bthwsd', x, torch.concat([x2[:,:,1:], x2[:,:,-1:]], 2))  # repeat the last frame
-        affinities2 = torch.einsum('bcthw,bctsd->bthwsd', x, torch.concat([x2[:,:,:1], x2[:,:,:-1]], 2))  # repeat the first frame 
-        features = torch.einsum('bctsd,bthwsd->bcthw', torch.concat([x2[:,:,1:], x2[:,:,-1:]], 2), F.sigmoid(affinities)-0.5 )* self.weights2[0] + \
-            torch.einsum('bctsd,bthwsd->bcthw', torch.concat([x2[:,:,:1], x2[:,:,:-1]], 2), F.sigmoid(affinities2)-0.5 ) * self.weights2[1] 
+        self.weights_s   = nn.Parameter(torch.ones(3) / 3)
+        self.weights_dir = nn.Parameter(torch.ones(2) / 2)
+        self.back = nn.Conv3d(red_ch, channels, kernel_size=1, bias=False)
 
-        x = self.down_conv(x)
-        aggregated_x = self.spatial_aggregation1(x)*self.weights[0] + self.spatial_aggregation2(x)*self.weights[1] \
-                    + self.spatial_aggregation3(x)*self.weights[2]
-        aggregated_x = self.conv_back(aggregated_x)
+    @staticmethod
+    def _shift(x, direction: str):
+        """
+        x : (B,C,T,H,W)
+        direction: 'next' or 'prev'
+        """
+        if direction == 'next':   #   t → t+1   (repeat last frame)
+            return torch.cat([x[:, :, 1:], x[:, :, -1:]], dim=2)
+        else:                     #   t → t-1   (repeat first frame)
+            return torch.cat([x[:, :, :1], x[:, :, :-1]], dim=2)
 
-        return features * (F.sigmoid(aggregated_x)-0.5)
-        
+    def forward(self, x):                       # (B,C,T,H,W)
+        q = self.down_q(x)                      # (B,C/32,T,H,W)
+        kv = self.down_kv(x)                    # (B,C,T,H,W)
+
+        feat_out = 0.0
+        for weight, direction in zip(self.weights_dir, ('next', 'prev')):
+            v = self._shift(kv, direction)      # (B,C,T,H,W)
+
+            # 1) correlation at *same* spatial position
+            sim = (x * v).sum(1, keepdim=True)          # (B,1,T,H,W)
+
+            # 2) gating
+            gate = torch.sigmoid(sim) - 0.5             # (B,1,T,H,W)
+
+            # 3) weighted value – broadcast gate over channels
+            feat_out = feat_out + weight * v * gate     # (B,C,T,H,W)
+
+        # ── spatial aggregation (unchanged) ──────────────────────────
+        x_red = self.down_q(x)                   # (B,C/32,T,H,W)
+        agg = ( self.spa1(x_red) * self.weights_s[0]
+              + self.spa2(x_red) * self.weights_s[1]
+              + self.spa3(x_red) * self.weights_s[2] )
+        agg = self.back(agg)                     # (B,C,T,H,W)
+
+        # final modulation
+        return feat_out * (torch.sigmoid(agg) - 0.5)
+    
 
 def conv3x3(in_planes, out_planes, stride=1):
     # 3x3x3 convolution with padding
@@ -60,6 +97,10 @@ def conv3x3(in_planes, out_planes, stride=1):
         stride=(1,stride,stride),
         padding=(0,1,1),
         bias=False)
+
+def conv1x1(in_planes: int, out_planes: int, stride: int = 1) -> nn.Conv2d:
+    """1x1 convolution"""
+    return nn.Conv3d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
 
 class BasicBlock(nn.Module):
     expansion = 1
@@ -93,6 +134,55 @@ class BasicBlock(nn.Module):
         return out
 
 
+class Bottleneck(nn.Module):
+    expansion: int = 4
+
+    def __init__(
+        self,
+        inplanes: int,
+        planes: int,
+        stride: int = 1,
+        downsample: Optional[nn.Module] = None,
+        groups: int = 1,
+        base_width: int = 64,
+        norm_layer: Optional[Callable[..., nn.Module]] = None,
+    ) -> None:
+        super().__init__()
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+        width = int(planes * (base_width / 64.0)) * groups
+        # Both self.conv2 and self.downsample layers downsample the input when stride != 1
+        self.conv1 = conv1x1(inplanes, width)
+        self.bn1 = nn.BatchNorm3d(width)
+        self.conv2 = conv3x3(width, width, stride=stride)
+        self.bn2 = nn.BatchNorm3d(width)
+        self.conv3 = conv1x1(width, planes * self.expansion)
+        self.bn3 = nn.BatchNorm3d(planes * self.expansion)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x: Tensor) -> Tensor:
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+
+        return out
 class ResNet(nn.Module):
 
     def __init__(self, block, layers, num_classes=1000):
@@ -148,11 +238,11 @@ class ResNet(nn.Module):
 
         x = checkpoint(self.layer1, x, use_reentrant=False)
         x = checkpoint(self.layer2, x, use_reentrant=False)
-        x = x + checkpoint(self.corr1, x, use_reentrant=False) * self.alpha[0]
+        x = x + self.corr1(x) * self.alpha[0]
         x = checkpoint(self.layer3, x, use_reentrant=False)
-        x = x + checkpoint1(self.corr2, x, use_reentrant=False) * self.alpha[1]
+        x = x + self.corr2(x) * self.alpha[1]
         x = checkpoint1(self.layer4, x, use_reentrant=False)
-        x = x + checkpoint1(self.corr3, x, use_reentrant=False) * self.alpha[2]
+        x = x + self.corr3(x) * self.alpha[2]
         x = x.transpose(1,2).contiguous()
         x = x.view((-1,)+x.size()[2:]) #bt,c,h,w
 
@@ -175,7 +265,7 @@ def resnet18(**kwargs):
     return model
 
 
-def resnet34_3d(**kwargs):
+def resnet34(**kwargs):
     """Constructs a ResNet-34 model.
     """
     model = ResNet(BasicBlock, [3, 4, 6, 3], **kwargs)
@@ -186,6 +276,40 @@ def resnet34_3d(**kwargs):
             checkpoint[ln] = checkpoint[ln].unsqueeze(2)  
     model.load_state_dict(checkpoint, strict=False)
     return model
+
+def resnet50(**kwargs):
+    """Constructs a ResNet-50 based model with 3-D kernels (inflated from 2-D weights)."""
+    model = ResNet(Bottleneck, [3, 4, 6, 3], **kwargs)          # 50 layers
+    checkpoint = model_zoo.load_url(model_urls['resnet50'])
+    for ln in list(checkpoint.keys()):
+        if 'conv' in ln or 'downsample.0.weight' in ln or ln == 'conv1.weight':
+            checkpoint[ln] = checkpoint[ln].unsqueeze(2)        # (O, I, 1, kH, kW)
+    model.load_state_dict(checkpoint, strict=False)
+    return model
+
+
+def resnet101(**kwargs):
+    """Constructs a ResNet-101 based model with 3-D kernels (inflated from 2-D weights)."""
+    model = ResNet(Bottleneck, [3, 4, 23, 3], **kwargs)         # 101 layers
+    checkpoint = model_zoo.load_url(model_urls['resnet101'])
+    for ln in list(checkpoint.keys()):
+        if 'conv' in ln or 'downsample.0.weight' in ln or ln == 'conv1.weight':
+            checkpoint[ln] = checkpoint[ln].unsqueeze(2)
+    model.load_state_dict(checkpoint, strict=False)
+    return model
+
+
+def resnet152(**kwargs):
+    """Constructs a ResNet-152 based model with 3-D kernels (inflated from 2-D weights)."""
+    model = ResNet(Bottleneck, [3, 8, 36, 3], **kwargs)         # 152 layers
+    checkpoint = model_zoo.load_url(model_urls['resnet152'])
+    modelState = model.state_dict()
+    for ln in list(checkpoint.keys()):
+        if 'conv' in ln or 'downsample.0.weight' in ln or ln == 'conv1.weight':
+            checkpoint[ln] = checkpoint[ln].unsqueeze(2)
+    model.load_state_dict(checkpoint, strict=False)
+    return model
+
 
 def resnet18_2d(**kwargs):
     """Constructs a ResNet-18 based model.
@@ -200,7 +324,7 @@ def resnet18_2d(**kwargs):
     return model
 
 
-def resnet34(**kwargs):
+def resnet34_2d(**kwargs):
     """Constructs a ResNet-34 model.
     """
     model = ResNetLib(BasicBlockLib, [3, 4, 6, 3], **kwargs)

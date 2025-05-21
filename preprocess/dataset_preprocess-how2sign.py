@@ -27,6 +27,7 @@ from collections import Counter
 
 stemmer = SnowballStemmer("english")
 
+unknownToken = "<UNK>"
 
 def csv2dict(anno_path, dataset_type, dataset_root, unknownTokens: set = set()):
     inputs_df = pandas.read_csv(anno_path, sep="\t")
@@ -36,9 +37,10 @@ def csv2dict(anno_path, dataset_type, dataset_root, unknownTokens: set = set()):
     )
     print(f"Generate information dict from {anno_path}")\
     
-    random_images = random.sample(list(inputs_df.iterrows()), 15)
+    random.seed(27)
+    random_images = random.sample(list(inputs_df.iterrows()), 3)
     # random_images = list(inputs_df.iterrows())
-    # for idx, row in tqdm(inputs_df.iterrows(), total=len(inputs_df)):
+    # for index, row in tqdm(inputs_df.iterrows(), total=len(inputs_df)):
     for index, (idx, row) in tqdm(enumerate(random_images), total=len(inputs_df)):
         video_id = str(row["VIDEO_ID"])
         sentence_name = str(row["SENTENCE_NAME"])  # corresponds to video file
@@ -55,7 +57,7 @@ def csv2dict(anno_path, dataset_type, dataset_root, unknownTokens: set = set()):
             "signer": signer,
             "label": label,
             "tokens": [
-                "<unk>" if x in unknownTokens else x
+                unknownToken if x in unknownTokens else x
                 for x in [stemmer.stem(gloss) for gloss in tokens]
             ],
             "video_path": video_path,
@@ -177,7 +179,9 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-    mode = ["val", "dev", "train"]
+    # mode = ["val", "dev", "train"]
+    mode = ["val", 'dev']
+    mode_submodes = {'val': ['val', 'test', 'dev'], 'dev': ['train']}
     existing_tokens = (
         [(x[0], x[1]) for x in np.load(f"./{args.dataset}/gloss_dict.npy", allow_pickle = True).tolist().items()]
         if os.path.exists(f"./{args.dataset}/gloss_dict.npy")
@@ -188,6 +192,7 @@ if __name__ == "__main__":
     # print(existing_tokens[:10])
     # low_ocurrance_token = set([x[0] for x in existing_tokens if x[1][1] < 50])
     low_ocurrance_token = set()
+    save_dict = {unknownToken: [0, 0]}
 
     sign_dict = dict()
     if not os.path.exists(f"./{args.dataset}"):
@@ -200,7 +205,12 @@ if __name__ == "__main__":
             dataset_root=args.dataset_root,
             unknownTokens=low_ocurrance_token,
         )
-        np.save(f"./{args.dataset}/{md}_info.npy", information)
+        if (not md in mode_submodes):
+            np.save(f"./{args.dataset}/{md}_info.npy", information)
+        else:
+            for smd in mode_submodes[md]:
+                np.save(f"./{args.dataset}/{smd}_info.npy", information)
+
         # update the total gloss dict
         sign_dict_update(sign_dict, information)
         # generate groudtruth stm for evaluation
@@ -229,14 +239,14 @@ if __name__ == "__main__":
                     )
 
     sign_dict = sorted(sign_dict.items(), key=lambda d: d[0])
-    top_highest = sorted([x for x in sign_dict if x[0] != '<unk>'], key=lambda x: x[1], reverse=True)
+    top_highest = sorted([x for x in sign_dict if x[0] != unknownToken], key=lambda x: x[1], reverse=True)
 
-    save_dict = {"<UNK>": [0, 0]}
+    save_dict = {unknownToken: [0, 0]}
     for idx, (key, value) in enumerate(sign_dict):
         save_dict[key] = [idx + 1, value]
 
     # print(save_dict)
-    # np.save(f"./{args.dataset}/gloss_dict.npy", save_dict)
+    np.save(f"./{args.dataset}/gloss_dict.npy", save_dict)
 
     pattern = re.compile(r"^[a-zA-Z0-9]+$")
     invalid_items = [
@@ -252,7 +262,7 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
 
 
-    frequencies = np.array([value for key, value in top_highest if key != '<UNK>'])
+    frequencies = np.array([value for key, value in top_highest if key != unknownToken])
     freq_sorted = np.sort(frequencies)[::-1]
     ranks = np.arange(1, len(freq_sorted) + 1)
 
@@ -278,6 +288,7 @@ if __name__ == "__main__":
     TTR = len(frequencies) / frequencies.sum()
 
     # Print metrics
+    print(f"num classes: {len(top_highest)}")
     print(f"Shannon Entropy:        {entropy:.4f}")
     print(f"Gini Coefficient:       {gini:.4f}")
     print(f"Type–Token Ratio (TTR): {TTR:.6f}")
@@ -311,6 +322,7 @@ if __name__ == "__main__":
 
     # Plot the distribution of gloss frequencies without labels
     frequencies = [value for key, value in top_highest]
+    # print(top_highest[:100])
 
     plt.figure(figsize=(12, 6))
     plt.plot(frequencies, color="skyblue", marker="o")
@@ -328,8 +340,10 @@ if __name__ == "__main__":
     range_groups = {}
     for key, value in top_highest:
         # Determine which range this value belongs to
-        range_start = 1 if value < 50 else ((value - 1) // 100 * 100 + 1)
-        range_end = range_start + 49
+        # range_start = value if value < 50 else ((value - 1) // 100 * 100 + 1)
+        # range_end = range_start + 49
+        range_start = value
+        range_end = range_start + 1
         range_key = f"{range_start}-{range_end}"
 
         # Add the actual frequency value to the total for this range

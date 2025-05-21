@@ -1,6 +1,7 @@
 import os
 import gc
 
+os.environ["TOKENIZERS_PARALLELISM"] = "true"
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 import yaml
 import torch
@@ -9,6 +10,7 @@ import numpy as np
 import time
 from collections import OrderedDict
 from torch.cuda.amp import autocast as autocast
+from tqdm import tqdm
 
 faulthandler.enable()
 import utils
@@ -18,6 +20,9 @@ from utils.parameters import ConfigArgs
 from utils.optimizer import Optimizer
 from dataset.dataloader_video import BaseFeeder
 from slr_network import SLRModel
+import random
+torch.manual_seed(0)
+random.seed(0)
 
 class Processor:
     def __init__(self, arg: ConfigArgs):
@@ -44,7 +49,8 @@ class Processor:
 
     def load_gloss_dict(self):
         self.gloss_dict = np.load(self.arg.dataset_info['dict_path'], allow_pickle=True).item()
-        self.arg.model_args['num_classes'] = len(self.gloss_dict) + 1
+        # print(self.gloss_dict)
+        self.arg.model_args['num_classes'] = len(self.gloss_dict)
 
     def load_model(self):
         self.device.set_device(self.arg.device)
@@ -71,7 +77,7 @@ class Processor:
         model.load_state_dict(clean_weights, strict=True)
 
     def _load_checkpoint(self, model: SLRModel, optimizer: Optimizer):
-        checkpoint = torch.load(self.arg.load_checkpoints)
+        checkpoint = torch.load(self.arg.load_checkpoints, weights_only=False)
         self._load_weights(model, self.arg.load_checkpoints)
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         optimizer.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -126,20 +132,20 @@ class Processor:
             self.extract_features()
 
     def train(self):
-        best_wer = 100.0
-        for epoch in range(self.arg.optimizer_args['start_epoch'], self.arg.num_epoch):
+        best_bleu = 100.0
+        for epoch in tqdm(range(self.arg.optimizer_args['start_epoch'], self.arg.num_epoch), position=0, desc="Training", leave=False):
             start_time = time.time()
 
             seq_train(self.data_loader[self.arg.phase], self.model, self.optimizer,
                       self.device, epoch, self.recoder)
 
-            if epoch % self.arg.eval_interval == 0:
-                wer = seq_eval(self.arg, self.data_loader['dev'], self.model,
+            if epoch % self.arg.eval_interval == 0: # and epoch != 0:
+                bleu = seq_eval(self.arg, self.data_loader['dev'], self.model,
                                self.device, 'dev', epoch, self.arg.work_dir, self.recoder,
                                self.arg.evaluate_tool)
 
-                if wer < best_wer:
-                    best_wer = wer
+                if bleu != 'nan' and bleu < best_bleu:
+                    best_bleu = bleu
                     self.save_model(epoch, f"{self.arg.work_dir}_best_model.pt")
 
             if epoch % self.arg.save_interval == 0:
